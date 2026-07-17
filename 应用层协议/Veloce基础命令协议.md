@@ -43,7 +43,7 @@
 **合法示例**：
 ```
 [cmd=handshake]
-[cmd=handshake_ack;id=Veloce-A1B2;ver=1.0;base_proto_ver=1.4;biz_proto_ver=1.3;max_frame_len=512]
+[cmd=handshake_ack;id=Lyre-A1B2;ver=1.0;base_proto_ver=1.4;biz_proto_ver=1.3;max_frame_len=512]
 [cmd=ping]
 ```
 
