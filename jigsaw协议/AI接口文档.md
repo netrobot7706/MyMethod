@@ -1,6 +1,6 @@
-## Jigsaw MIDI Transport Library V3.27 – AI Developer’s Contract & API Reference
+# Jigsaw MIDI Transport Library V3.27 – AI Developer’s Contract & API Reference
 
-### 1. Overview
+## 1. Overview
 Jigsaw is a reliable transport layer built on top of MIDI Control Change messages. It provides:
 - Silent, byte‑by‑byte transparent frame transfer over MIDI CC#3/CC#9.
 - 16‑bit additive checksum, start/end framing.
@@ -12,7 +12,7 @@ Jigsaw is a reliable transport layer built on top of MIDI Control Change message
 **Protocol version**: Byte Over CC Channel‑Bit Transport V1.4.1.  
 **Library version**: 3.27.
 
-### 2. Integration Header
+## 2. Integration Header
 
 Include the library in a C project:
 ```c
@@ -20,7 +20,7 @@ Include the library in a C project:
 ```
 No additional dependencies beyond standard C library (`stdint`, `stddef`, `stdbool`, `string`).
 
-### 3. Compile‑time Configuration
+## 3. Compile‑time Configuration
 
 Define the following macros **before** including `jigsaw.h` or via compiler flags:
 
@@ -28,26 +28,28 @@ Define the following macros **before** including `jigsaw.h` or via compiler flag
 |-------|---------|-------------|
 | `JIGSAW_ENTER_CRITICAL()` | `((void)0)` | Enter critical section (disable interrupts / acquire lock) |
 | `JIGSAW_EXIT_CRITICAL()` | `((void)0)` | Exit critical section (re‑enable interrupts / release lock) |
-| `JIGSAW_ACK_ENABLED` | `1` | Enable ACK handshake (0 = disable, Start→Data immediately; WAIT_ACK never returned) |
+| `JIGSAW_ACK_ENABLED` | `1` | Enable ACK handshake (0 = disable, Start→Data immediately; `JIGSAW_TX_WAIT_ACK` is never returned) |
 | `JIGSAW_AUTO_RETRY` | `1` | Automatic retransmission on NAK (0 = manual only) |
 | `JIGSAW_ACK_TIMEOUT_MS` | `500` | ACK wait timeout in milliseconds |
-| `JIGSAW_TX_BUF_SIZE` | `256` | Internal TX buffer size (bytes) – only used when `JIGSAW_ZERO_COPY_TX` is **not** defined |
-| `JIGSAW_MAX_FRAME_SIZE` | `8192` | Maximum frame payload length (bytes) |
+| `JIGSAW_TX_BUF_SIZE` | `256` | Internal TX buffer size (bytes) – only used when `JIGSAW_ZERO_COPY_TX` is **not** defined. **Must be ≥ the maximum frame length you intend to send**; otherwise `jigsaw_tx_submit` will reject the frame with `JIGSAW_ERR_OVERFLOW`. |
+| `JIGSAW_MAX_FRAME_SIZE` | `8192` | Maximum frame payload length (bytes) for both TX and RX. If your TX buffer is smaller, the actual TX limit is `JIGSAW_TX_BUF_SIZE`. |
 | `JIGSAW_BATCH_INTERVAL_MS` | `10` | Interval between batches of MIDI messages (milliseconds) |
 | `JIGSAW_BATCH_SIZE` | `64` | Number of data bytes per batch |
 | `JIGSAW_RX_TIMEOUT_MS` | `500` | RX inactivity watchdog timeout (milliseconds) |
 | `JIGSAW_MAX_RETRIES` | `3` | Maximum NAK retransmission attempts (after initial try) |
-| `JIGSAW_ZERO_COPY_TX` | *(undefined)* | If defined, TX buffer is not used; caller must keep data valid until transmission completes |
+| `JIGSAW_ZERO_COPY_TX` | *(undefined)* | If defined, the TX buffer is not used; caller must keep data valid until transmission completes. When defined, the TX size limit is `JIGSAW_MAX_FRAME_SIZE`. |
 
-### 4. Type Declarations
+If `JIGSAW_ZERO_COPY_TX` is defined, the TX buffer is not used; user must keep data valid until transmission finishes.
 
-#### 4.1 Opaque Context
+## 4. Type Declarations
+
+### 4.1 Opaque Context
 ```c
 typedef struct jigsaw_ctx_t jigsaw_ctx_t;
 ```
 All state is stored in this struct. Application must instantiate one instance (global/static), never copied.
 
-#### 4.2 Error / Status Codes (`jigsaw_status_t`)
+### 4.2 Error / Status Codes (`jigsaw_status_t`)
 | Enum Value | Integer | Meaning |
 |------------|---------|---------|
 | `JIGSAW_OK` | 0 | Operation succeeded |
@@ -59,7 +61,7 @@ All state is stored in this struct. Application must instantiate one instance (g
 | `JIGSAW_ERR_OVERFLOW` | -6 | Frame too large for buffer |
 | `JIGSAW_ERR_SIGNAL_PENDING` | -7 | Pending signal (ACK/NAK) must be drained first |
 
-#### 4.3 RX Event (`jigsaw_rx_event_t`)
+### 4.3 RX Event (`jigsaw_rx_event_t`)
 Returned by `jigsaw_rx_feed`.
 
 | Event | Value | Description |
@@ -73,7 +75,7 @@ Returned by `jigsaw_rx_feed`.
 | `JIGSAW_RX_ERR_OVERFLOW` | -2 | RX buffer overflow (frame discarded) |
 | `JIGSAW_RX_ERR_PROTOCOL` | -3 | Protocol violation (unexpected signal) |
 
-#### 4.4 TX Event (`jigsaw_tx_event_t`)
+### 4.4 TX Event (`jigsaw_tx_event_t`)
 Returned by `jigsaw_tx_next_message`.
 
 | Event | Value | Description |
@@ -86,7 +88,7 @@ Returned by `jigsaw_tx_next_message`.
 | `JIGSAW_TX_FRAME_FAILED` | 5 | Frame transmission failed after retries |
 | `JIGSAW_TX_ABORTED` | 6 | Frame transmission aborted due to peer start (pre‑emption) |
 
-#### 4.5 Tick Event (`jigsaw_tick_event_t`)
+### 4.5 Tick Event (`jigsaw_tick_event_t`)
 Returned by `jigsaw_tick`.
 
 | Event | Value | Description |
@@ -95,9 +97,9 @@ Returned by `jigsaw_tick`.
 | `JIGSAW_TICK_TX_CONTINUE` | 1 | Call `jigsaw_tx_next_message` to resume TX |
 | `JIGSAW_TICK_RX_TIMEOUT` | 2 | RX watchdog timeout occurred; state reset |
 
-### 5. Lifecycle
+## 5. Lifecycle
 
-#### `jigsaw_init`
+### `jigsaw_init`
 ```c
 jigsaw_status_t jigsaw_init(jigsaw_ctx_t *ctx, uint8_t *rx_buf, size_t rx_buf_size);
 ```
@@ -108,18 +110,18 @@ jigsaw_status_t jigsaw_init(jigsaw_ctx_t *ctx, uint8_t *rx_buf, size_t rx_buf_si
 - `rx_buf_size` – size of `rx_buf` (max `JIGSAW_MAX_FRAME_SIZE`)
 
 **Return**: `JIGSAW_OK` or `JIGSAW_ERR_PARAM`.  
-**Contract**: Must be called **once** before any other API. Call from task context (not ISR).
+**Contract**: Must be called **once** before any other API. Task context only.
 
-#### `jigsaw_reset`
+### `jigsaw_reset`
 ```c
 void jigsaw_reset(jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Reset all RX/TX state and release bus. Clears pending signals, retry counters, buffers.  
 **Thread safety**: Task context only; caller must ensure no concurrent access to `ctx`.
 
-### 6. Receiving Data
+## 6. Receiving Data
 
-#### `jigsaw_rx_feed`
+### `jigsaw_rx_feed`
 ```c
 jigsaw_rx_event_t jigsaw_rx_feed(jigsaw_ctx_t *ctx, uint8_t ch, uint8_t cc, uint8_t val, uint32_t now_ms);
 ```
@@ -131,10 +133,10 @@ jigsaw_rx_event_t jigsaw_rx_feed(jigsaw_ctx_t *ctx, uint8_t ch, uint8_t cc, uint
 - `now_ms` – current monotonic millisecond timestamp (wraps around safely, library uses unsigned difference)
 
 **Return**: `jigsaw_rx_event_t` – see Section 4.3.  
-**Contract**: ISR‑safe. Messages not matching protocol channels/CC numbers return `JIGSAW_RX_IDLE` and are silently ignored. The timestamp must be monotonically increasing; wraparound is handled correctly by the library.  
-**Concurrency**: Multiple ISRs may call this function concurrently, provided critical section macros are properly implemented to serialize access.
+**Contract**: ISR‑safe. Messages not matching protocol channels/CC numbers return `JIGSAW_RX_IDLE` and are silently ignored. The timestamp must be monotonically increasing; wraparound is handled correctly.  
+**Concurrency**: Multiple ISRs may call this function concurrently, provided critical section macros properly serialize access.
 
-#### `jigsaw_rx_get_frame`
+### `jigsaw_rx_get_frame`
 ```c
 jigsaw_status_t jigsaw_rx_get_frame(const jigsaw_ctx_t *ctx, const uint8_t **data, size_t *len);
 ```
@@ -146,23 +148,23 @@ jigsaw_status_t jigsaw_rx_get_frame(const jigsaw_ctx_t *ctx, const uint8_t **dat
 **Return**: `JIGSAW_OK` if frame available, `JIGSAW_ERR_NO_FRAME` if none.  
 **Contract**: ISR‑safe (uses critical section internally). The pointer is valid until the next call to `jigsaw_rx_feed` or `jigsaw_rx_release_frame`. If you defer processing to the main loop, ensure no new `jigsaw_rx_feed` call occurs before you have consumed the frame — otherwise the buffer may be overwritten.
 
-#### `jigsaw_rx_release_frame` — **REQUIRED**
+### `jigsaw_rx_release_frame` — **REQUIRED**
 ```c
 void jigsaw_rx_release_frame(jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Mark the current frame as consumed, allowing a new frame to be recorded.  
 **Contract**: ISR‑safe. **You MUST call this immediately after processing a completed frame.** Do not rely on a subsequent Start signal to clear the flag.
 
-#### `jigsaw_rx_get_nak_reason`
+### `jigsaw_rx_get_nak_reason`
 ```c
 uint8_t jigsaw_rx_get_nak_reason(const jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Retrieve the NAK reason code (0 = none, 0x01 = checksum error, 0x02 = timeout).  
 **Contract**: Task context.
 
-### 7. Transmitting Data
+## 7. Transmitting Data
 
-#### `jigsaw_tx_submit`
+### `jigsaw_tx_submit`
 ```c
 jigsaw_status_t jigsaw_tx_submit(jigsaw_ctx_t *ctx, const uint8_t *data, size_t len);
 ```
@@ -171,10 +173,17 @@ jigsaw_status_t jigsaw_tx_submit(jigsaw_ctx_t *ctx, const uint8_t *data, size_t 
 - `data` – pointer to data to send (copied internally unless `JIGSAW_ZERO_COPY_TX` is defined)
 - `len` – number of bytes (1 .. `JIGSAW_MAX_FRAME_SIZE`; 0 returns `JIGSAW_ERR_PARAM`)
 
-**Return**: `JIGSAW_OK` on success, `JIGSAW_ERR_BUS_BUSY` if bus not free, `JIGSAW_ERR_TX_BUSY` if TX state machine not idle, `JIGSAW_ERR_SIGNAL_PENDING` if pending signals exist.  
-**Contract**: Task context only. If `JIGSAW_ZERO_COPY_TX` is defined, the caller must keep `data` valid until `jigsaw_tx_is_complete()` returns `true` (or `JIGSAW_TX_FRAME_COMPLETE`/`JIGSAW_TX_FRAME_FAILED` is returned from `jigsaw_tx_next_message`).
+**Return**:  
+- `JIGSAW_OK` on success.  
+- `JIGSAW_ERR_BUS_BUSY` if bus not free.  
+- `JIGSAW_ERR_TX_BUSY` if TX state machine not idle.  
+- `JIGSAW_ERR_SIGNAL_PENDING` if pending signals exist.  
+- `JIGSAW_ERR_OVERFLOW` if `len > JIGSAW_MAX_FRAME_SIZE`, or (in non‑zero‑copy mode) if `len > JIGSAW_TX_BUF_SIZE`.  
+- `JIGSAW_ERR_PARAM` if `data == NULL` or `len == 0`.
 
-#### `jigsaw_tx_next_message`
+**Contract**: Task context only. If using the internal buffer (default), ensure `JIGSAW_TX_BUF_SIZE` is configured large enough for your frames.
+
+### `jigsaw_tx_next_message`
 ```c
 jigsaw_tx_event_t jigsaw_tx_next_message(jigsaw_ctx_t *ctx, uint8_t *ch, uint8_t *cc, uint8_t *val);
 ```
@@ -183,7 +192,7 @@ jigsaw_tx_event_t jigsaw_tx_next_message(jigsaw_ctx_t *ctx, uint8_t *ch, uint8_t
 **Return**: `jigsaw_tx_event_t` – see Section 4.4.  
 **Contract**: ISR‑safe. In a drain loop, stop when the event is any of: `JIGSAW_TX_IDLE`, `JIGSAW_TX_FRAME_COMPLETE`, `JIGSAW_TX_FRAME_FAILED`, `JIGSAW_TX_WAIT_ACK`, or `JIGSAW_TX_BATCH_END`. For `JIGSAW_TX_MSG_READY`, construct a MIDI CC message: `(0xB0 | ch), cc, val` and send it.
 
-#### `jigsaw_tx_restart`
+### `jigsaw_tx_restart`
 ```c
 jigsaw_status_t jigsaw_tx_restart(jigsaw_ctx_t *ctx);
 ```
@@ -191,9 +200,9 @@ jigsaw_status_t jigsaw_tx_restart(jigsaw_ctx_t *ctx);
 **Return**: `JIGSAW_OK`, `JIGSAW_ERR_BUS_BUSY`, `JIGSAW_ERR_SIGNAL_PENDING`, `JIGSAW_ERR_RETRY_LIMIT`.  
 **Contract**: Task context only. Consumes one NAK retry count.
 
-### 8. Timing & Status
+## 8. Timing & Status
 
-#### `jigsaw_tick`
+### `jigsaw_tick`
 ```c
 jigsaw_tick_event_t jigsaw_tick(jigsaw_ctx_t *ctx, uint32_t now_ms);
 ```
@@ -203,37 +212,37 @@ jigsaw_tick_event_t jigsaw_tick(jigsaw_ctx_t *ctx, uint32_t now_ms);
 **Contract**: Task context. If it returns `JIGSAW_TICK_TX_CONTINUE`, continue calling `jigsaw_tx_next_message` to send data. `JIGSAW_TICK_RX_TIMEOUT` indicates an RX watchdog timeout (state reset, possible NAK queued).  
 **Timing**: Calling less frequently (e.g., 50 ms) will not cause data loss, only degrade throughput; the library remains correct.
 
-#### `jigsaw_bus_is_free`
+### `jigsaw_bus_is_free`
 ```c
 bool jigsaw_bus_is_free(const jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Check if the transport bus is available for a new transmission (no RX active and TX idle).  
 **Contract**: ISR‑safe.
 
-#### `jigsaw_tx_is_complete`
+### `jigsaw_tx_is_complete`
 ```c
 bool jigsaw_tx_is_complete(const jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Check if the current TX operation has finished (success, failure, or abort).  
 **Contract**: ISR‑safe.
 
-#### `jigsaw_tx_is_aborted`
+### `jigsaw_tx_is_aborted`
 ```c
 bool jigsaw_tx_is_aborted(const jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Check if `tx_abort_pending` flag is set (peer started a transmission).  
 **Contract**: ISR‑safe.
 
-#### `jigsaw_tx_has_pending`
+### `jigsaw_tx_has_pending`
 ```c
 bool jigsaw_tx_has_pending(const jigsaw_ctx_t *ctx);
 ```
 **Purpose**: Check if there are pending signals (ACK/NAK) or NAK reason bytes to be sent. If `true`, continue calling `jigsaw_tx_next_message` until `false`.  
 **Contract**: ISR‑safe.
 
-### 9. Concurrency Model
+## 9. Concurrency Model
 
-| Function | ISR-safe? |
+| Function | ISR‑safe? |
 |----------|-----------|
 | `jigsaw_init` | ❌ Task only |
 | `jigsaw_reset` | ❌ Task only |
@@ -252,11 +261,11 @@ bool jigsaw_tx_has_pending(const jigsaw_ctx_t *ctx);
 
 Critical section macros (`JIGSAW_ENTER_CRITICAL` / `JIGSAW_EXIT_CRITICAL`) must be provided by the application to protect against concurrent ISR access. If macros are empty (single‑threaded), the library works but is not ISR‑safe.
 
-### 10. Typical Integration Patterns
+## 10. Typical Integration Patterns
 
 > **Note**: Functions like `midi_send()`, `get_monotonic_ms()`, and `sleep_ms()` are application‑provided pseudocode and not part of the library.
 
-#### 10.1 Initialisation (once)
+### 10.1 Initialisation (once)
 ```c
 static jigsaw_ctx_t jigsaw;
 static uint8_t rx_buffer[8192];
@@ -269,8 +278,8 @@ void init() {
 }
 ```
 
-#### 10.2 MIDI Receive ISR / Callback
-**Purpose**: Handle protocol signals (ACK/NAK) and complete frames with minimal latency.  
+### 10.2 MIDI Receive ISR / Callback
+**Purpose**: Handle protocol signals (ACK/NAK) and completed frames with minimal latency.  
 **Rule**: Process completed frames and signal draining here; bulk payload draining is handled in the Main Loop.
 ```c
 void on_midi_cc(uint8_t status, uint8_t data1, uint8_t data2) {
@@ -303,7 +312,7 @@ void on_midi_cc(uint8_t status, uint8_t data1, uint8_t data2) {
 }
 ```
 
-#### 10.3 Main Loop (or RTOS task)
+### 10.3 Main Loop (or RTOS task)
 **Purpose**: Drive the bulk data transmission and periodic housekeeping.  
 **Rule**: Drain payload data when `jigsaw_tick` returns `TX_CONTINUE`.
 ```c
@@ -334,7 +343,7 @@ void main_loop() {
 }
 ```
 
-#### 10.4 Sending a Frame
+### 10.4 Sending a Frame
 ```c
 void send_data(const uint8_t *payload, size_t len) {
     jigsaw_status_t s = jigsaw_tx_submit(&jigsaw, payload, len);
@@ -343,25 +352,28 @@ void send_data(const uint8_t *payload, size_t len) {
     } else if (s == JIGSAW_ERR_SIGNAL_PENDING) {
         // Call jigsaw_tx_next_message until jigsaw_tx_has_pending() becomes false,
         // then retry jigsaw_tx_submit.
+    } else if (s == JIGSAW_ERR_OVERFLOW) {
+        // Frame too large for current buffer configuration; adjust JIGSAW_TX_BUF_SIZE
+        // or enable JIGSAW_ZERO_COPY_TX.
     }
 }
 ```
 
-### 11. Error Handling
+## 11. Error Handling
 
 - After `JIGSAW_TX_FRAME_FAILED`, the application may call `jigsaw_tx_restart()` or submit a new frame (after ensuring bus is free).
 - After `JIGSAW_TX_ABORTED`, automatic retry will happen if `JIGSAW_AUTO_RETRY` is enabled, else manual restart is required.
 - If `jigsaw_tx_submit` returns `JIGSAW_ERR_SIGNAL_PENDING`, call `jigsaw_tx_next_message` repeatedly until `jigsaw_tx_has_pending()` returns `false`, then retry.
 - If a frame is lost due to checksum error, the library automatically queues a NAK; the sender handles retransmission (if auto‑retry) or the application must handle it.
 
-### 12. Buffer Lifecycle (Zero‑Copy Mode)
+## 12. Buffer Lifecycle (Zero‑Copy Mode)
 
 When `JIGSAW_ZERO_COPY_TX` is defined:
 - **THE DATA BUFFER MUST REMAIN VALID** until `jigsaw_tx_is_complete()` returns `true` or one of the terminal TX events is emitted.
 - **FAILURE TO KEEP DATA VALID WILL CAUSE UNDEFINED BEHAVIOR (MEMORY CORRUPTION / WILD POINTER READ).**
 - **NEVER** use a local stack buffer for zero‑copy transmission unless you statically guarantee it outlives the transmission (essentially impossible for asynchronous I/O).
 
-### 13. Protocol Constants (for reference)
+## 13. Protocol Constants (for reference)
 
 - Control channel: 13 (MIDI Ch.14, 0‑based)
 - Data channels: 14 (bit 7 = 0) and 15 (bit 7 = 1)
@@ -373,7 +385,7 @@ When `JIGSAW_ZERO_COPY_TX` is defined:
 - ACK: `(0xBD, 0x03, 0x10)`
 - NAK: `(0xBD, 0x03, 0x11)`
 
-### 14. Integration Checklist (for AI agents)
+## 14. Integration Checklist (for AI agents)
 
 1. [ ] Define `JIGSAW_ENTER_CRITICAL`/`JIGSAW_EXIT_CRITICAL` appropriate to the platform.
 2. [ ] Allocate a `jigsaw_ctx_t` and an RX buffer of at least 256 bytes (recommend 8 KB for full protocol).
@@ -386,7 +398,7 @@ When `JIGSAW_ZERO_COPY_TX` is defined:
 9. [ ] On `RX_FRAME_COMPLETE`, retrieve the frame with `jigsaw_rx_get_frame` and **immediately** call `jigsaw_rx_release_frame`.
 10. [ ] If `TX_ABORTED` or `TX_FAILED` is received, handle according to application retry policy.
 
-### 15. AI Invariants (Must Not Violate)
+## 15. AI Invariants (Must Not Violate)
 
 > **To AI Agents**: The following rules are non‑negotiable. Violating any of them will result in undefined behavior, deadlocks, or silent data corruption.
 
@@ -418,5 +430,9 @@ When `JIGSAW_ZERO_COPY_TX` is defined:
 
 8. **Frame Pointer Lifetime**:
    - The pointer returned by `jigsaw_rx_get_frame` is valid only until the next `jigsaw_rx_feed` or `jigsaw_rx_release_frame`. If you defer processing, you must guarantee no `jigsaw_rx_feed` call occurs in the meantime.
+
+9. **TX Buffer Size vs. Max Frame**:
+   - If `JIGSAW_ZERO_COPY_TX` is **not** defined, you **MUST** ensure `JIGSAW_TX_BUF_SIZE >=` the maximum frame length you will send. The library does **not** perform dynamic fragmentation; oversized frames are rejected with `JIGSAW_ERR_OVERFLOW`.
+   - If you need to send frames larger than the default 256 bytes, either increase `JIGSAW_TX_BUF_SIZE` (at the cost of RAM) or define `JIGSAW_ZERO_COPY_TX` and manage the buffer yourself.
 
 This document constitutes the complete public API contract. Any behavioral detail not described herein is considered internal and subject to change without notice.
