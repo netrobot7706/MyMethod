@@ -1,34 +1,36 @@
 /**
- * LyreDevice.js
+ * LyreDevice.js v2 (State Management Pattern)
  * 
- * Lyre 四推杆 MIDI 控制器产品协议库 (v1.4)
- * 基于 Veloce Base Command Protocol 构建
+ * 核心变化：
+ * 1. 内部维护 this._config 作为“寄存器”。
+ * 2. 暴露 getPotConfig / setPotConfig 供上层读写内存状态。
+ * 3. load() 从设备拉取并更新寄存器。
+ * 4. save() 将寄存器全量写入设备。
  */
 
-/**
- * 定义错误类，用于区分产品层错误和基础协议错误
- */
 class LyreError extends Error {
   constructor(message, code, originalError = null) {
     super(message);
     this.name = 'LyreError';
-    this.code = code; // 产品错误码 (如 3, 5) 或基础错误码
+    this.code = code;
     this.originalError = originalError;
   }
 }
 
 class LyreDevice {
-  /**
-   * 构造函数
-   * @param {VeloceBaseProtocol} protocol - 已实例化的 VeloceBaseProtocol 对象
-   */
   constructor(protocol) {
     this.protocol = protocol;
 
-    // 注册命令超时与重试策略 (根据文档第 5 节)
-    this._registerCommands();
+    // 初始化内部状态寄存器 (默认为空或 null，需调用 load() 填充)
+    // 结构: [{ midiCh: 1, cc: 70, min: 0, max: 0 }, ...]
+    this._configStore = null;
 
-    // 绑定基础协议的生命周期事件
+    // 标记状态是否脏（是否与设备不同步）
+    this._isDirty = false;
+
+    this._registerCommands();
+    
+    // 绑定事件
     this.protocol.setEventHandlers({
       onDisconnected: (reason) => console.warn(`[Lyre] Disconnected: ${reason}`),
       onFatalError: (err) => console.error(`[Lyre] Fatal Error:`, err),
@@ -36,182 +38,178 @@ class LyreDevice {
     });
   }
 
-  /**
-   * 注册特定命令的超时与重试配置
-   */
-  _registerCommands() {
-    // read_cfg: 1000ms, retry 2
-    this.protocol.registerCommand('read_cfg', {
-      domain: 'config',
-      timeoutMs: 1000,
-      retries: 2
-    });
-
-    // write_cfg: 2000ms, retry 0 (避免重复写Flash)
-    this.protocol.registerCommand('write_cfg', {
-      domain: 'config',
-      timeoutMs: 2000,
-      retries: 0
-    });
-
-    // read_adc: 500ms, retry 2
-    this.protocol.registerCommand('read_adc', {
-      domain: 'config',
-      timeoutMs: 500,
-      retries: 2
-    });
-  }
-
   // ==========================================
-  // 1. 核心配置操作 (全量读写)
+  // 1. 生命周期：加载与保存
   // ==========================================
 
   /**
-   * 读取设备当前配置
-   * @returns {Promise<Array>} 返回包含 4 个推杆配置对象的数组
+   * 从设备加载配置，更新内部寄存器
+   * 页面初始化时调用此方法
    */
-  async readConfig() {
+  async load() {
     try {
       const resp = await this.protocol.sendCommand('read_cfg', {});
-      return this._parseConfigResponse(resp);
+      // 解析并存入寄存器
+      this._configStore = this._parseConfigResponse(resp);
+      this._isDirty = false;
+      console.log('[Lyre] 配置已加载到寄存器', this._configStore);
+      return this._configStore;
     } catch (e) {
-      throw this._wrapError(e, '读取配置失败');
+      throw this._wrapError(e, '加载配置失败');
     }
   }
 
   /**
-   * 写入配置（全量写入）
-   * 内部会自动合并当前未修改的字段，确保发送 16 个完整字段。
-   * 
-   * @param {Array} newConfigs - 包含 4 个推杆配置的数组。允许只提供部分推杆的配置，未提供的将保持原值。
-   * @returns {Promise<void>}
+   * 将当前内部寄存器的配置全量写入设备
+   * 通常在用户点击“保存”按钮时调用
    */
-  async writeConfig(newConfigs) {
-    // 1. 先读取现有配置以保证数据完整性（符合文档 7.2 建议）
-    let currentConfigs;
-    try {
-      currentConfigs = await this.readConfig();
-    } catch (e) {
-      // 如果读取失败（例如设备还没配置过），使用默认全空结构或抛错？
-      // 文档说 read_cfg 若无配置返回出厂默认值，所以一般会成功。
-      // 若读取彻底失败，无法进行部分合并，必须中止。
-      throw new LyreError('无法获取当前配置以进行合并写入，写入中止', -1, e);
+  async save() {
+    if (!this._configStore) {
+      throw new LyreError('配置未初始化，请先调用 load()', -1);
     }
 
-    // 2. 合并配置
-    const finalConfigs = currentConfigs.map((oldCfg, index) => {
-      const newCfg = newConfigs[index] || {};
-      return { ...oldCfg, ...newCfg };
-    });
+    // 1. 前端校验
+    this._validateConfigData(this._configStore);
 
-    // 3. 校验数据合法性 (前端预校验，减少设备端报错)
-    this._validateConfigData(finalConfigs);
-
-    // 4. 构造请求参数 (扁平化)
+    // 2. 构造参数
     const params = {};
-    finalConfigs.forEach((cfg, idx) => {
+    this._configStore.forEach((cfg, idx) => {
       params[`${idx}_midi_ch`] = String(cfg.midiCh);
       params[`${idx}_cc`] = String(cfg.cc);
       params[`${idx}_min`] = String(cfg.min);
       params[`${idx}_max`] = String(cfg.max);
     });
 
-    // 5. 发送命令
+    // 3. 发送
     try {
       await this.protocol.sendCommand('write_cfg', params);
+      this._isDirty = false; // 保存成功，标记为同步
     } catch (e) {
-      throw this._wrapError(e, '写入配置失败');
+      throw this._wrapError(e, '保存配置失败');
     }
   }
 
   // ==========================================
-  // 2. ADC 采集操作
+  // 2. 状态访问接口 (上层 JS 调用)
   // ==========================================
 
   /**
-   * 读取指定推杆的当前 ADC 原始值
-   * @param {number} potIndex - 推杆索引 (0-3)
-   * @returns {Promise<number>} ADC 值 (0-4095)
+   * 获取所有推杆的配置（用于渲染 UI 初始状态）
    */
-  async readADC(potIndex) {
-    if (potIndex < 0 || potIndex > 3) {
-      throw new LyreError('推杆索引必须在 0-3 之间', 5);
-    }
+  getAllConfigs() {
+    if (!this._configStore) return null;
+    // 返回深拷贝，防止上层直接修改引用导致状态混乱
+    return JSON.parse(JSON.stringify(this._configStore));
+  }
 
-    try {
-      // 发送 read_adc，响应为 report_adc
-      const resp = await this.protocol.sendCommand('read_adc', { pot: String(potIndex) });
-      
-      // 文档 3.3 指出应答帧为 report_adc
-      if (resp.get('cmd') === 'report_adc') {
-        return parseInt(resp.get('raw'), 10);
-      } else {
-        throw new LyreError(`未预期的应答命令: ${resp.get('cmd')}`, -1);
-      }
-    } catch (e) {
-      throw this._wrapError(e, `读取推杆 ${potIndex} ADC 失败`);
+  /**
+   * 获取单个推杆的配置
+   * @param {number} index 0-3
+   */
+  getPotConfig(index) {
+    if (!this._configStore) return null;
+    return { ...this._configStore[index] }; // 返回副本
+  }
+
+  /**
+   * 更新单个推杆的配置（更新寄存器，不立即写入设备）
+   * 上层控件值变化时调用此方法
+   * 
+   * @param {number} index 
+   * @param {object} partialConfig { midiCh?: number, cc?: number, min?: number, max?: number }
+   */
+  setPotConfig(index, partialConfig) {
+    if (!this._configStore) {
+      console.warn('[Lyre] 警告: 尚未加载配置，更新将被忽略');
+      return;
     }
+    if (index < 0 || index > 3) return;
+
+    // 合并配置
+    this._configStore[index] = {
+      ...this._configStore[index],
+      ...partialConfig
+    };
+    
+    this._isDirty = true;
+    
+    // 可选：抛出事件通知 UI 更新（如果 UI 采用响应式数据绑定则不需要）
+    // this.emit('change', this._configStore);
+  }
+
+  /**
+   * 检查是否有未保存的更改
+   */
+  isDirty() {
+    return this._isDirty;
   }
 
   // ==========================================
-  // 3. 校准辅助功能
+  // 3. 校准功能 (基于寄存器操作)
   // ==========================================
 
   /**
-   * 校准辅助类，用于管理单个推杆的校准状态
+   * 获取校准会话
+   * 流程：startCalibration() -> setMin()/setMax() -> commit()
    */
-  createCalibrationSession() {
+  startCalibration(potIndex) {
+    const self = this;
+    
+    // 返回一个校准控制器对象
     return {
-      // 存储校准过程中的临时值
-      _values: [null, null, null, null], 
+      potIndex: potIndex,
 
-      /**
-       * 记录推杆的最小值
-       */
-      async recordMin(potIndex) {
-        this._values[potIndex] = this._values[potIndex] || { min: 0, max: 0 };
-        this._values[potIndex].min = await this.readADC(potIndex);
+      async readCurrent() {
+        return await self.readADC(potIndex);
       },
 
-      /**
-       * 记录推杆的最大值
-       */
-      async recordMax(potIndex) {
-        this._values[potIndex] = this._values[potIndex] || { min: 0, max: 0 };
-        this._values[potIndex].max = await this.readADC(potIndex);
+      /** 设置最大值到寄存器 */
+      async setMax() {
+        const val = await self.readADC(potIndex);
+        self.setPotConfig(potIndex, { max: val });
+        console.log(`[Lyre] Pot ${potIndex} Max set to ${val} (暂存)`);
       },
 
-      /**
-       * 提交所有校准数据并写入设备
-       * @param {Array} currentFullConfig - 当前完整的配置对象数组 (由 readConfig 获取)
-       */
-      async commit(currentFullConfig) {
-        const patch = [];
-        
-        for (let i = 0; i < 4; i++) {
-          if (!this._values[i]) {
-            // 如果该推杆未参与校准，保持原值
-            patch.push(null);
-          } else {
-            patch.push({
-              min: this._values[i].min,
-              max: this._values[i].max
-            });
-          }
-        }
+      /** 设置最小值到寄存器 */
+      async setMin() {
+        const val = await self.readADC(potIndex);
+        self.setPotConfig(potIndex, { min: val });
+        console.log(`[Lyre] Pot ${potIndex} Min set to ${val} (暂存)`);
+      },
 
-        await this.writeConfig(patch);
+      /** 将校准数据写入寄存器后，调用主保存 */
+      async saveToDevice() {
+        return await self.save();
       }
     };
   }
 
+  /**
+   * 读取 ADC 原始值
+   */
+  async readADC(potIndex) {
+    if (potIndex < 0 || potIndex > 3) throw new LyreError('推杆索引越界', 5);
+    try {
+      const resp = await this.protocol.sendCommand('read_adc', { pot: String(potIndex) });
+      if (resp.get('cmd') === 'report_adc') {
+        return parseInt(resp.get('raw'), 10);
+      }
+      throw new LyreError('响应帧格式错误', -1);
+    } catch (e) {
+      throw this._wrapError(e, 'ADC 读取失败');
+    }
+  }
+
   // ==========================================
-  // 内部辅助方法
+  // 内部辅助
   // ==========================================
 
-  /**
-   * 解析 read_cfg 返回的 Map 为结构化数组
-   */
+  _registerCommands() {
+    this.protocol.registerCommand('read_cfg', { domain: 'config', timeoutMs: 1000, retries: 2 });
+    this.protocol.registerCommand('write_cfg', { domain: 'config', timeoutMs: 2000, retries: 0 });
+    this.protocol.registerCommand('read_adc',  { domain: 'config', timeoutMs: 500,  retries: 2 });
+  }
+
   _parseConfigResponse(fields) {
     const configs = [];
     for (let i = 0; i < 4; i++) {
@@ -225,45 +223,28 @@ class LyreDevice {
     return configs;
   }
 
-  /**
-   * 前端数据校验 (避免发送非法数据导致设备报错 code=3)
-   */
   _validateConfigData(configs) {
-    if (configs.length !== 4) throw new Error('配置数组长度必须为 4');
-
+    if (!configs || configs.length !== 4) throw new LyreError('配置数据结构非法', 3);
     configs.forEach((cfg, idx) => {
-      if (cfg.midiCh < 1 || cfg.midiCh > 16) throw new LyreError(`推杆${idx} MIDI通道越界 (1-16)`, 3);
-      if (cfg.cc < 0 || cfg.cc > 127) throw new LyreError(`推杆${idx} CC号越界 (0-127)`, 3);
+      if (cfg.midiCh < 1 || cfg.midiCh > 16) throw new LyreError(`推杆${idx} 通道越界`, 3);
+      if (cfg.cc < 0 || cfg.cc > 127) throw new LyreError(`推杆${idx} CC 越界`, 3);
       if (cfg.min >= cfg.max) throw new LyreError(`推杆${idx} Min必须小于Max`, 3);
     });
   }
 
-  /**
-   * 错误包装器
-   * 解析 CommandError 中的 remoteMsg，转换为 LyreError
-   */
   _wrapError(error, fallbackMsg) {
     if (error.name === 'CommandError') {
-      // 产品特定错误 (Code 3: Invalid Fields, Code 5: Pot Index)
-      if (error.remoteMsg) {
-        return new LyreError(`${fallbackMsg}: ${error.remoteMsg}`, error.code, error);
-      }
+      return new LyreError(`${fallbackMsg}: ${error.remoteMsg}`, error.code, error);
     }
-    // 基础协议错误 (Timeout, ConnectionLost, VersionMismatch) 直接透传
     return new LyreError(fallbackMsg, error.code || -1, error);
   }
 
-  /**
-   * 处理异步帧 (如果设备主动发送 report_adc 或 device_status)
-   */
   _handleAsyncFrame(cmd, fields) {
     if (cmd === 'report_adc') {
       const pot = parseInt(fields.get('pot'), 10);
       const raw = parseInt(fields.get('raw'), 10);
-      console.log(`[Lyre] Async ADC Update: Pot ${pot} = ${raw}`);
-      // 可在此处触发事件通知上层 UI
-    } else if (cmd === 'device_status') {
-      console.log(`[Lyre] Device Status:`, fields);
+      // 如果需要处理设备主动上报的 ADC 变化，可以在这里触发事件
+      console.log(`[Lyre] Async ADC: Pot ${pot} = ${raw}`);
     }
   }
 }
