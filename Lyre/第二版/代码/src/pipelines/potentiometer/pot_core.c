@@ -31,7 +31,7 @@ bool pot_core_process(uint16_t raw_in_12bit,
                       pot_core_state_t *state,
                       uint8_t *midi_out)
 {
-    // 参数有效性检查
+    // 防御性检查：超出设计文档前置条件的 NULL 指针保护（增强代码健壮性）
     if (!state || !midi_out) return false;
 
     // 防御：校准值无效时直接放弃
