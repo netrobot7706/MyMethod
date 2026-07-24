@@ -26,7 +26,8 @@ void pot_hal_init(void) {
 
 uint16_t pot_hal_read_channel(uint8_t channel) {
     // 参数范围检查：通道 0-3 对应 ADC 输入 0-3
-    if (channel > 3) return 0;
+    // 返回 0xFFFF 表示错误，与系统级错误值约定一致（超出 12‑bit ADC 有效范围）
+    if (channel > 3) return 0xFFFF;
 
     // 选择 ADC 输入通道
     adc_select_input(channel);
