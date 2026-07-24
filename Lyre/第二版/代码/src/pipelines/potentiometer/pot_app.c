@@ -18,11 +18,11 @@
 /* -------------------------------------------------------------------------- */
 
 static struct {
-    bool paused;                          // 暂停标志
-    bool event_pending[POT_COUNT];        // 事件就绪标志
-    uint8_t event_channel[POT_COUNT];     // 事件 MIDI 通道
-    uint8_t event_cc[POT_COUNT];          // 事件 CC 号
-    uint8_t event_value[POT_COUNT];       // 事件 MIDI 值
+    volatile bool paused;               // 暂停标志（volatile 防御性要求，设计文档 §6 强制）
+    bool event_pending[POT_COUNT];      // 事件就绪标志
+    uint8_t event_channel[POT_COUNT];   // 事件 MIDI 通道
+    uint8_t event_cc[POT_COUNT];        // 事件 CC 号
+    uint8_t event_value[POT_COUNT];     // 事件 MIDI 值
     pot_core_state_t core_states[POT_COUNT]; // 核心算法状态
 } pot_ctx;
 
@@ -50,7 +50,7 @@ void pot_poll(void) {
     // 暂停时不处理
     if (pot_ctx.paused) return;
 
-    // 1. 拉取配置快照（批量接口保证一致性）
+    // 1. 拉取配置快照（批量接口保证一致性与原子性）
     pot_mapping_t mappings[POT_COUNT];
     pot_calibration_t cals[POT_COUNT];
     uint8_t count;
