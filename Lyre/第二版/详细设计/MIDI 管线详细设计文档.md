@@ -83,7 +83,20 @@ void midi_parser_feed(midi_parser_t *parser, const uint8_t *data, uint32_t len);
 void midi_parser_reset(midi_parser_t *parser);
 ```
 
-**状态机**（与 v3.0 相同，略）。
+**状态机**
+```text
+IDLE:
+  收到 0xF0 → 进入 RECEIVING，清空 buffer，len=0
+  收到其他 → 忽略
+
+RECEIVING:
+  收到 0xF0 → 重新开始接收（清空 buffer，len=0）
+  收到 0xF7 → 若 len > 0 且 len ≤ max_len，调用 frame_handler(buffer, len)；回到 IDLE
+  收到状态字节 (≥0x80 且非 0xF0/0xF7) → 协议错误，丢弃帧，回到 IDLE
+  收到数据字节 (<0x80) → 存入 buffer，len++
+     若 len > max_len → 丢弃帧，回到 IDLE
+  实时消息 (0xF8–0xFF) → 忽略（不破坏当前帧）
+```
 
 **中断安全**：`midi_parser_feed` 在 USB 中断回调中执行，`frame_handler` 回调会调用 `midi_transport_rx_enqueue`，内部有关中断保护。若单次 `feed` 中包含背靠背 SysEx（`...F7 F0...`），会同步完成当前帧并开始新帧，嵌套关中断在 Cortex-M0+ 上安全（PRIMASK 嵌套无副作用）。
 
