@@ -1,28 +1,11 @@
-审计确认与最终完整代码输出：
+经过逐项核实，本次审计报告中的问题判断如下：
 
-经过逐轮审计和修复，以下问题已被确认真实存在并已全部修正：
-- H-1：SysEx 一次性写入空间检查不足
-- H-2：热插拔后发送通道未清理导致死锁
-- M-1：分段发送 0xF0 可能重复
-- M-3/L-1：临界区保护因 include guard 失效
-- L-2：描述符重复填充
-- L-3：缺少配置描述符
-- N-1：分段路径在起始字节未发时发送数据
-- N-3：MIDI 描述符参数错误
-- L2-H1：rx_enqueue 缺少帧长度上限校验
-- L2-M1：一次性写入未检查 tx_write 返回值
-- L2-M2：send_cc 缺少 channel 范围校验
-- L2-L1：SPSC 模型注释
-- L2-L2：字符串描述符回调 NULL 保护
-- L2-L3：临界区不可重入改为嵌套安全
-- L2-V1：分段路径 tx_written 未使用实际写入量
-- L2-V2：分段路径 0xF0/0xF7 未检查返回值
-- L2-V5：增加显式 tud_task() 调用
-- L2-V3：多实例临界区约束注释
+- **H-1（描述符参数错误）：不存在**。TinyUSB 的 `TUD_MIDI_DESCRIPTOR` 宏实际签名为 5 个参数 `(_itfnum, _stridx, _epout, _epin, _epsize)`，代码中传入的参数完全正确，不会导致 USB 接收失效。此条为误报。
+- **H-2（字符串回调返回 NULL）：存在，但实际风险较低**。当前固件在 `midi_hal_init` 时已确保传入的 `usb_desc` 指针有效且字符串非 NULL，因此不会触发。但为彻底消除隐患，改为返回一个合法的空字符串描述符，避免任何情况下返回 NULL。
+- **M-1（临界区嵌套隐患）：当前无实际风险**。目前只有 MIDI 管线使用临界区，不存在多管线计数器冲突。保留现有实现，并在注释中明确说明未来扩展时的注意事项。
+- **M-2（缓冲区大小与协议长度耦合）：接受观察**。当前设计满足需求，添加注释说明约束即可。
 
-L2-V4 确认为误报，无需修改。
-
-以下为整合所有修复后的完整代码。
+仅需修复 H-2 并补充少量注释。以下是修复后的最终完整代码（所有文件）。
 
 ---
 
@@ -306,6 +289,7 @@ bool midi_transport_send_sysex(midi_transport_t *t, const uint8_t *data, uint16_
 {
     if (t->tx_active) return false;
     if (!t->connected) return false;
+    // tx_buf_size 必须 >= MIDI_SYSEX_MAX_LEN，否则长消息会被拒绝
     if (len > t->tx_buf_size) return false;
 
     // 一次性写入路径
@@ -324,7 +308,6 @@ bool midi_transport_send_sysex(midi_transport_t *t, const uint8_t *data, uint16_
     t->tx_active = true;
     t->tx_start_sent = false;
 
-    // 尝试发送起始字节
     if (!t->tx_start_sent && t->driver.tx_available() >= 1) {
         uint8_t start = 0xF0;
         if (t->driver.tx_write(&start, 1) == 1) {
@@ -366,7 +349,6 @@ void midi_transport_tx_flush(midi_transport_t *t)
         return;
     }
 
-    // 发送起始字节
     if (!t->tx_start_sent) {
         if (t->driver.tx_available() >= 1) {
             uint8_t start = 0xF0;
@@ -380,7 +362,6 @@ void midi_transport_tx_flush(midi_transport_t *t)
         }
     }
 
-    // 发送 payload
     uint32_t rem = t->tx_len - t->tx_written;
     uint32_t avail = t->driver.tx_available();
     uint32_t to_write = (rem < avail) ? rem : avail;
@@ -389,7 +370,6 @@ void midi_transport_tx_flush(midi_transport_t *t)
         t->tx_written += (uint16_t)written;
     }
 
-    // 发送结束字节
     if (t->tx_written == t->tx_len) {
         if (t->driver.tx_available() >= 1) {
             uint8_t end = 0xF7;
@@ -522,8 +502,12 @@ static uint8_t const midi_config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 2, 0,
                           TUD_CONFIG_DESC_LEN + TUD_MIDI_DESC_LEN,
                           0x00, 100),
+    // TUD_MIDI_DESCRIPTOR 参数：接口号, 字符串索引, OUT端点, IN端点, 端点大小
     TUD_MIDI_DESCRIPTOR(0, 0, 0x01, 0x81, CFG_TUD_MIDI_EP_BUFSIZE)
 };
+
+// 空字符串描述符（防止返回 NULL）
+static uint8_t const empty_string_desc[] = { 2, 0x03 };
 
 // ===== USB 回调 =====
 uint8_t const * tud_descriptor_device_cb(void)
@@ -547,9 +531,9 @@ uint8_t const * tud_descriptor_string_cb(uint8_t index, uint16_t langid)
     const char *str = NULL;
     if (index == 1) str = usb_desc.manufacturer;
     else if (index == 2) str = usb_desc.product;
-    else return NULL;
+    else return empty_string_desc; // 未知索引，返回空描述符
 
-    if (str == NULL) return NULL;
+    if (str == NULL) return empty_string_desc; // 防御：返回空描述符而非 NULL
 
     size_t len = strlen(str);
     if (len > 31) len = 31;
@@ -647,7 +631,7 @@ static midi_transport_t transport;
 /*
  * 临界区保护策略：
  * - 所有使用者共享同一屏蔽级别（全局中断禁用）
- * - 若未来需要独立屏蔽级别，请改为 per-instance 回调
+ * - 当前仅 MIDI 管线使用，若未来多管线共享需确保计数器唯一，或提升为平台级公共函数
  */
 static volatile uint32_t crit_primask_save;
 static volatile int      crit_nesting = 0;
@@ -738,4 +722,4 @@ void midi_task(void) {
 
 ---
 
-以上即为经过 L1、L2 全量审计修复后的最终 MIDI 管线代码，所有已知缺陷均已关闭，架构符合设计文档要求，可进入集成与测试阶段。
+以上代码已整合所有审计修复，包含对 H-2 的防御性改进，并添加了关键设计约束的注释。代码可进入集成测试阶段。
