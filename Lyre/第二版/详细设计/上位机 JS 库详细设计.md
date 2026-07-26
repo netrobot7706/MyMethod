@@ -1,11 +1,11 @@
-# 上位机 JS 库详细设计
+# 上位机 JS 库详细设计 v1.6
 
 ## 1. 概述
 
-本文档描述一个基于 **Web MIDI API** 的 JavaScript 库 **LyreConfigSDK**，用于在浏览器中实现《MIDI 控制器自描述配置协议 v2.6》定义的完整上位机功能。该库可直接内联于 HTML 页面，生成单页配置工具。
+本文档描述基于 **Web MIDI API** 的 JavaScript 库 **LyreConfigSDK**，用于在浏览器中实现《MIDI 控制器自描述配置协议 v2.6》定义的完整上位机功能。该库可直接内联于 HTML 页面，生成单页配置工具。
 
 **核心能力**：
-- 自动发现并连接符合条件的 MIDI 设备
+- 手动选择 MIDI 端口并连接目标设备
 - 发送/接收 SysEx 消息，完整实现 0x03–0x12 命令
 - 解析物理描述、面板布局树、虚拟控件表、ADC 原始值
 - 提供校准向导、虚拟配置编辑、写入与校验功能
@@ -29,24 +29,19 @@
 │    ProtocolCodec (编解码、校验和、验证)       │
 ├─────────────────────────────────────────────┤
 │                  MIDI 传输层                  │
-│    MidiTransport (连接管理、SysEx 收发队列)   │
+│    MidiTransport (端口选择、SysEx 收发队列)   │
 ├─────────────────────────────────────────────┤
 │              Web MIDI API                    │
 └─────────────────────────────────────────────┘
 ```
 
-- **MidiTransport**：封装 `navigator.requestMIDIAccess`，管理输入/输出端口，提供异步的 SysEx 请求/响应匹配。
-- **ProtocolCodec**：纯函数集合，实现所有命令的编码、解码、校验和计算及数据验证。
-- **DeviceService**：面向业务的高级接口，组合 MidiTransport 与 ProtocolCodec，提供“连接并初始化”“读取全部配置”“执行校准”“写入虚拟配置”等方法，并处理重试逻辑。
-- **视图层**：包含布局树渲染器 `LayoutRenderer`、虚拟配置编辑器、校准向导等 UI 组件，用于直接操作 DOM。视图层由库提供，但宿主页面可自定义样式和布局容器。
-
 ---
 
 ## 3. 依赖与运行环境
 
-- 浏览器支持 **Web MIDI API**（Chrome / Edge / Opera 等）。
-- 无需任何第三方库，全部代码以 **ES6 模块或 IIFE** 内联方式提供，可直接嵌入 `<script>` 标签。
-- 使用 `async/await` 和 `Promise`，需浏览器支持 ES2017。
+- 浏览器支持 **Web MIDI API**（Chrome / Edge / Opera 等）
+- 无需第三方库，以 **IIFE** 内联方式提供
+- 使用 `async/await` 和 `Promise`，需 ES2017+
 
 ---
 
@@ -56,49 +51,66 @@
 
 #### 4.1.1 职责
 - 请求 MIDI 访问权限
-- 枚举输入/输出设备，按名称或设备 ID（通过 SysEx 查询）筛选目标设备
-- 为每个设备建立独立的 `Input` 和 `Output` 连接
-- 发送 SysEx 消息，并等待匹配的响应（支持超时与重试）
+- 枚举可用输入/输出端口，供用户手动选择
+- 基于用户选择异步创建连接句柄（含端口打开）
+- 发送 SysEx 消息，异步匹配响应
+- 提供干净的断开与资源释放
 
 #### 4.1.2 主要数据结构
+
 ```typescript
+interface MIDIPortInfo {
+  id: string;       // MIDIPort.id
+  name: string;     // MIDIPort.name
+}
+
 interface MidiDeviceHandle {
   input: MIDIInput;
   output: MIDIOutput;
-  deviceId: number;        // SysEx 中使用的设备 ID (0x00–0x7E)
+  deviceId: number;        // 0x00–0x7E
 }
 ```
 
 #### 4.1.3 核心方法
 
-- `requestAccess(): Promise<MIDIAccess>`
-  请求用户授权 MIDI 访问。
+- `requestAccess(): Promise<MIDIAccess>`  
+  请求用户授权，拒绝则抛 `MidiAccessDeniedError`。
 
-- `scanDevices(access: MIDIAccess, predicate?: FilterFn): Promise<MidiDeviceHandle[]>`
-  枚举所有输入/输出端口，自动配对同名端口，并对每个候选设备发送 `0x03` 查询设备信息，根据响应中的设备 ID 建立句柄。可自定义过滤条件。
+- `getAvailablePorts(access: MIDIAccess): { inputs: MIDIPortInfo[], outputs: MIDIPortInfo[] }`  
+  返回所有可用 MIDI 端口信息。
 
-- `sendSysex(device: MidiDeviceHandle, msg: Uint8Array, responseCmd?: number, timeout?: number): Promise<Uint8Array>`
-  发送 SysEx 消息，如果提供 `responseCmd`，则等待该命令的响应消息（超时默认 500ms）。内部维护未完成请求队列，通过命令字和消息匹配。
+- `async createHandle(access: MIDIAccess, inputId: string, outputId: string, deviceId: number): Promise<MidiDeviceHandle>`  
+  1. 验证 `deviceId` 在 `0x00–0x7E` 内，否则抛出 `RangeError`。
+  2. 获取 `input` 和 `output` 端口对象，不存在则抛出 `Error`。
+  3. **异步打开端口**：`await input.open(); await output.open();`（若 output 打开失败，需关闭已打开的 input 并重新抛出异常）。
+  4. 注册 `input.onmidimessage` 回调用于响应匹配。
+  5. 返回 `{ input, output, deviceId }`。
 
-- `onSysex(callback: (msg: Uint8Array) => void): void`
-  注册全局 SysEx 监听器，用于被动接收消息（如后续固件主动推送）。库本身内部使用该机制进行响应匹配。
+- `sendSysex(device: MidiDeviceHandle, msg: Uint8Array, responseCmd?: number, timeout = 500): Promise<Uint8Array>`  
+  发送 SysEx，若提供 `responseCmd`，返回匹配响应。超时或校验和错误策略同 v1.5。
 
-#### 4.1.4 响应匹配逻辑
-每个输出消息分配单调递增的事务 ID（或直接用命令字 + 时间戳）。当收到 SysEx 消息时，首先解析命令字、设备 ID，如果与某个挂起请求匹配，则 resolve 对应 Promise，否则交给 `onSysex` 回调。匹配时额外校验消息长度与校验和（校验和错误视为无效响应，触发重试）。
+- `disconnect(device: MidiDeviceHandle): void`  
+  完整清理：reject 所有 pending 请求为 `DisconnectedError`，移除 `onmidimessage`，关闭 `input`/`output`（`input.close(); output.close()`），清除队列。
 
-#### 4.1.5 错误处理
-- 超时抛出 `TimeoutError`
-- 校验和错误抛出 `ChecksumError`
-- MIDI 访问被拒抛出 `MidiAccessDeniedError`
+#### 4.1.4 错误类
+
+```typescript
+class TimeoutError extends Error {}
+class ChecksumError extends Error {}
+class DisconnectedError extends Error {}
+class MidiAccessDeniedError extends Error {}
+```
+
+**重试策略**：本层不自动重试。
 
 ---
 
 ### 4.2 协议编解码器 `ProtocolCodec`
 
-#### 4.2.1 职责
-提供所有 SysEx 命令的构建与解析函数，负责数据格式校验、14-bit 编解码、校验和计算。与固件端 `cmd_core` 保持对应。
+**职责**：提供所有 SysEx 命令的构建、解析、验证函数。
 
-#### 4.2.2 常量定义
+#### 4.2.1 常量
+
 ```typescript
 const SYSEX_START = 0xF0;
 const SYSEX_END   = 0xF7;
@@ -119,57 +131,52 @@ const CMD_QUERY_ADC_RAW       = 0x11;
 const CMD_ADC_RAW_RESPONSE    = 0x12;
 ```
 
-#### 4.2.3 工具函数
-- `rolandChecksum(data: number[] | Uint8Array): number`
-  计算 Roland 式校验和，范围：`sum = data.reduce(...) & 0x7F; return (128 - sum) & 0x7F`。
+#### 4.2.2 工具函数
 
-- `validateSysEx(msg: Uint8Array, expectedCmd?: number, expectedDeviceId?: number): boolean`
-  校验消息完整性、F0/F7、校验和。
+- `rolandChecksum(data: Uint8Array | number[]): number`
+- `computeMessageChecksum(fullMsg: Uint8Array): number`  
+  自动提取 `msg.slice(1, msg.length - 2)`。
+- `encode14bit(value: number): [number, number]` 输入 0–16383。
+- `decode14bit(mid: number, lo: number): number`
+- `validateSysEx(msg: Uint8Array, expectedCmd?, expectedDeviceId?): boolean`
 
-- `encode14bit(value: number): [number, number]`  
-  `decode14bit(mid: number, lo: number): number`
-
-#### 4.2.4 命令构建函数（静态方法，返回 Uint8Array）
-
-每个函数均接收必要参数，返回完整 SysEx 消息（包含 F0..F7）。
+#### 4.2.3 命令构建
 
 | 方法 | 说明 |
 |------|------|
-| `buildQueryPhysical(deviceId)` | 构建 0x03 查询消息 |
-| `buildQueryLayout(deviceId)` | 构建 0x07 查询消息 |
-| `buildQueryVirtual(deviceId)` | 构建 0x0B 查询消息 |
-| `buildSetVirtual(deviceId, B, V, controls)` | 构建 0x0D 写入消息，`controls` 为 `{bank, physIdx, cc, channel}[]` |
-| `buildSetCalibration(deviceId, N, calibrations)` | 构建 0x0F 写入消息，`calibrations` 为 `{minMid, minLo, maxMid, maxLo}[]` 或直接提供 `Uint16` 数组后编码 |
-| `buildQueryRawADC(deviceId)` | 构建 0x11 查询消息 |
+| `buildQueryPhysical(deviceId)` | 0x03 |
+| `buildQueryLayout(deviceId)` | 0x07 |
+| `buildQueryVirtual(deviceId)` | 0x0B |
+| `buildSetVirtual(deviceId, B, V, controls)` | 0x0D，字段非法抛 `ValidationError` |
+| `buildSetCalibration(deviceId, N, calibrations)` | 0x0F，接收 `{min,max}[]` |
+| `buildQueryRawADC(deviceId)` | 0x11 |
 
-#### 4.2.5 响应解析函数
+#### 4.2.4 响应解析
 
-| 方法 | 输入 | 输出 | 说明 |
-|------|------|------|------|
-| `parsePhysicalResponse(msg)` | SysEx 字节数组 | `{N, protocolVersion, physControls: PhysDesc[]}` | `PhysDesc: {mux, channel, calMin, calMax}`，其中 calMin/calMax 已解码为 16-bit 值 |
-| `parseLayoutResponse(msg)` | 同上 | `{treeBytes: Uint8Array, length: number}` | 返回原始树字节流，不在此层解析树结构 |
-| `parseVirtualResponse(msg)` | 同上 | `{B, V, controls: VirtualCtrl[]}` | `VirtualCtrl: {bank, physIdx, cc, channel}` |
-| `parseAck(msg, expectedCmd)` | 同上 | `{status: number}` | 0=成功, 1=失败 |
-| `parseRawADCResponse(msg)` | 同上 | `{N, rawValues: number[]}` | 已解码的 14-bit 原始值数组 |
+| 方法 | 输出 | 说明 |
+|------|------|------|
+| `parsePhysicalResponse(msg)` | `{N, protocolVersion, physControls}` | 校验和错误抛 `ChecksumError` |
+| `parseLayoutResponse(msg)` | `{declaredLength, treeBytes}` | 校验和错误同上 |
+| `parseVirtualResponse(msg)` | `{B, V, controls}` | 只解析，不做约束校验 |
+| `parseAck(msg, expectedCmd)` | `{status: number}` | status=0/1/2 |
+| `parseRawADCResponse(msg)` | `{N, rawValues}` | 14‑bit 解码 |
 
-所有解析函数首先调用 `validateSysEx`，失败则抛出异常。
+**0x04 响应字节偏移表**（同 v1.2）。
 
-#### 4.2.6 数据验证函数（对应固件端 `cmd_proto_validate_*`）
+#### 4.2.5 数据验证
 
-- `validateVirtualConfig(controls, B, V, N): {valid: boolean, error?: string}`
-  检查数组长度、字段范围、唯一性（bank*N + physIdx 不得重复）。
-
-- `validateCalibrationData(calibrations, N): {valid: boolean, error?: string}`
-  检查长度、每项 cal_max > cal_min。
+- `validateVirtualConfig(controls, B, V, N)`：检查长度、字段范围、bit7、唯一性。
+- `validateCalibrationData(calibrations, N)`：检查范围、max>min、编码后 bit7。
 
 ---
 
 ### 4.3 设备服务层 `DeviceService`
 
 #### 4.3.1 职责
-封装设备交互流程，提供面向 UI 的业务 API。管理设备状态，处理重试策略。
+面向 UI 的高级 API，管理设备状态、重试、校准、事件。
 
-#### 4.3.2 设备状态模型 `DeviceState`
+#### 4.3.2 状态模型 `DeviceState` 及初始值
+
 ```typescript
 interface DeviceState {
   connected: boolean;
@@ -179,58 +186,80 @@ interface DeviceState {
     protocolVersion: number;
     controls: PhysDesc[];
   };
-  layoutTree: LayoutNode | null;   // 树结构
+  layoutTree: LayoutNode | null;
   virtual: {
     B: number;
     V: number;
     controls: VirtualCtrl[];
   };
   calibration: {
-    rawMin: number[];   // 最近一次采集的最小 ADC 值
-    rawMax: number[];   // 最近一次采集的最大 ADC 值
+    rawMin: number[] | null;
+    rawMax: number[] | null;
     status: 'uncalibrated' | 'calibrated' | 'unknown';
   };
 }
+
+const INITIAL_STATE: DeviceState = {
+  connected: false,
+  deviceHandle: null,
+  physical: { N: 0, protocolVersion: 0, controls: [] },
+  layoutTree: null,
+  virtual: { B: 0, V: 0, controls: [] },
+  calibration: { rawMin: null, rawMax: null, status: 'unknown' }
+};
 ```
-物理描述与虚拟配置从设备读取后直接填充，校准状态通过比较当前存储的 min/max 是否为默认值 (0/4095) 判断。
 
 #### 4.3.3 核心方法
 
-- `connect(deviceHandle: MidiDeviceHandle): Promise<void>`
-  保存设备句柄，依次调用 `queryPhysicalInfo`, `queryLayout`, `queryVirtualConfig`，填充 `DeviceState`。
+- **`async connectAndInitialize(access, inputId, outputId, deviceId): Promise<DeviceState>`**  
+  1. `const handle = await MidiTransport.createHandle(...);`
+  2. 内部调用私有方法 `connect(handle)`，该方法发送 0x03、检查版本、查询布局和虚拟配置（含 `V ≤ B×N` 校验），若失败自动清理并重新抛出。
+  3. 监听 `access.onstatechange`，当关联的输入/输出端口移除时，自动断开并触发 `deviceDisconnected` 事件。
+  4. 返回完整 `DeviceState`。
 
-- `disconnect(): void`
-  关闭 MIDI 端口监听（如果必要），重置状态。
+- **`disconnect(): void`**  
+  若未连接（`connected === false`），静默返回。否则：
+  - 移除 `onstatechange` 监听
+  - 调用 `MidiTransport.disconnect(state.deviceHandle!)`
+  - 重置状态为 `INITIAL_STATE`
+  - **不触发** `deviceDisconnected` 事件（用户主动操作）
 
-- `queryPhysicalInfo(): Promise<PhysicalInfo>`
-  发送 0x03，等待 0x04，解析并存储。
+- **`async writeVirtualConfig(controls): Promise<void>`**  
+  构建 0x0D 消息一次，发送并等待 0x0E ACK。status=1 时重试（最多一次），重试时发送同一字节数组。
 
-- `queryLayout(): Promise<LayoutNode>`
-  发送 0x07，等待 0x08，调用 `LayoutParser.parse(treeBytes)` 得到树。
+- **`async startCalibrationWizard(onPrompt): Promise<void>`**  
+  使用局部变量，成功后才更新状态。若用户取消，`onPrompt` 应 reject `CancelSignal`，向导转为 `CalibrationCancelledError`。
 
-- `queryVirtualConfig(): Promise<VirtualInfo>`
-  发送 0x0B，等待 0x0C，解析并存储。
+- **`async readRawADC(): Promise<number[]>`**  
+  发送 0x11，返回原始值。**调用前必须连接**，否则抛 `NotConnectedError`。
 
-- `writeVirtualConfig(controls: VirtualCtrl[]): Promise<void>`
-  先本地验证（`validateVirtualConfig`），然后构建 0x0D 消息发送，等待 0x0E 应答。若返回 NACK 或通信失败，按协议重试 1 次（共 2 次尝试，间隔 400ms）。
+- **`getCalibrationStatus(): string`**  
+  仅检查旋钮/推杆控件。
 
-- `startCalibrationWizard(onPrompt: (phase: string) => void): Promise<void>`
-  执行上位机辅助校准流程：
-  1. 调用 `onPrompt('min')` 提示用户将控件调至最小值。
-  2. 连续发送 5 次 0x11（间隔 50ms），取每个物理控件的中位数作为 `calMin[]`。
-  3. 调用 `onPrompt('max')` 提示调至最大值。
-  4. 同样采集 5 次取中位数作为 `calMax[]`。
-  5. 对于布局树中类型为旋钮/推杆的控件，验证 `calMax[i] > calMin[i]`，否则抛出 `CalibrationRangeError` 并提示重试。
-  6. 按钮控件保持默认值 min=0, max=4095。
-  7. 构建 0x0F 消息发送，等待 ACK。
-  8. 成功后更新状态。
+- **`editVirtual(bank, physIdx, field, value): void`**  
+  即时验证：
+  - `field === 'cc'` → `0 <= value <= 127`
+  - `field === 'channel'` → `0 <= value <= 15`
+  - `bank` 和 `physIdx` 需在已加载的有效范围内。
+  非法则抛出 `ValidationError`。修改后标记脏。
 
-- `readRawADC(): Promise<number[]>`
-  单次发送 0x11，返回原始值数组，用于调试或手动校准。
+- **`exportConfig(): string`**  
+  若未连接，抛出 `NotConnectedError`。返回 JSON 字符串，schema 见第 9 节。
 
-#### 4.3.4 重试与错误恢复
-- 所有命令发送均设置超时 500ms，超时后重试一次。
-- 连续失败则标记设备断开，触发 `onDisconnect` 回调。
+- **`on(event, handler): () => void`**  
+  - `'error'`：任意模块错误，回调接收 `Error`。
+  - `'deviceDisconnected'`：**仅在非用户主动断开的情况下**（如 USB 拔出）触发，回调无参数。  
+  返回取消订阅函数。
+
+#### 4.3.4 错误类
+
+```typescript
+class CancelSignal extends Error {}
+class CalibrationCancelledError extends Error {}
+class ProtocolViolationError extends Error {}
+class NotConnectedError extends Error {}
+class ValidationError extends Error {}
+```
 
 ---
 
@@ -247,30 +276,31 @@ interface ContainerNode {
   type: 'hbox' | 'vbox' | 'grid';
   children: LayoutNode[];
   cols?: number;   // 仅 grid
-  rows?: number;   // 仅 grid
+  rows?: number;
 }
 
 interface LeafNode {
-  type: 'knob' | 'fader' | 'button';
-  physIndex: number;   // 物理控件逻辑索引
+  type: 'knob' | 'fader' | 'button' | 'unknown';
+  physIndex: number;
 }
 ```
 
 #### 4.4.3 解析算法
-- 使用游标 `pos` 在 `Uint8Array` 上递归读取。
-- 遇到容器节点，读取子节点数量或行列数，递归构建子节点。
-- 遇到叶子节点，读取物理索引。
-- 遇到未知容器节点（0x01–0x0F），抛出 `UnknownContainerError` 并终止。
-- 遇到未知叶子节点（0x10–0x3F），消耗索引字节，生成一个占位符叶子节点，类型标记为 `unknown`，以便 UI 提示。
-
-解析完成后，验证叶子节点总数是否与物理控件数 N 匹配（可选警告）。
+- 静态方法 `parse(treeBytes: Uint8Array, declaredLength: number): LayoutNode`
+- 使用游标 `pos` 在 `treeBytes` 上递归读取，**严格以 `declaredLength` 为边界**。
+- 读取前检查 `pos < declaredLength`，越界则抛出 `MalformedTreeError`。
+- 解析完成后检查 `pos === declaredLength`，不等则抛出 `MalformedTreeError`。
+- 容器节点：读取子节点数量，递归构建子节点。Grid 额外校验 `cols * rows <= 127` 及子节点数量一致性。
+- 叶子节点：读取物理索引。
+- 未知容器节点（0x01–0x0F）：抛出 `UnknownContainerError`。
+- 未知叶子节点（0x10–0x3F）：消耗索引字节，生成类型为 `'unknown'` 的叶子节点。
 
 ---
 
 ### 4.5 UI 渲染模块 `LayoutRenderer`
 
 #### 4.5.1 职责
-根据 `LayoutNode` 树和物理/虚拟配置，生成对应的 DOM 元素，并绑定交互事件。此模块供单页工具直接使用。
+根据 `LayoutNode` 树和物理/虚拟配置，生成对应的 DOM 元素，并绑定交互事件。
 
 #### 4.5.2 核心方法
 - `render(container: HTMLElement, layout: LayoutNode, context: RenderContext): void`
@@ -278,30 +308,25 @@ interface LeafNode {
 
 `RenderContext` 提供：
 - `deviceState: DeviceState`
-- `onVirtualChange(index: number, field: string, value: number): void`  用于编辑虚拟控件参数
-- `onCalibrate(): void`  触发校准向导
+- `onVirtualChange(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void`
+- `onCalibrate(): void`
 
 #### 4.5.3 渲染规则
-- **水平容器 (HBox)**：生成 `display: flex; flex-direction: row;` 的 DIV。
-- **垂直容器 (VBox)**：生成 `display: flex; flex-direction: column;` 的 DIV。
-- **网格容器 (Grid)**：生成 CSS Grid 容器，行列数由属性决定。
-- **旋钮 / 推杆**：根据 `physIndex` 查找对应的虚拟控件绑定（在当前选中的库下），显示一个滑块 (`<input type="range">`) 或旋钮样式（可用 CSS 模拟），并在旁边显示 CC 号、通道等可编辑字段。
-- **按钮**：同理显示一个按钮样式，可配置其 CC / 通道（若存在虚拟控件绑定）。
+- 水平容器 → `display: flex; flex-direction: row;`
+- 垂直容器 → `display: flex; flex-direction: column;`
+- 网格容器 → CSS Grid，行列数由属性决定
+- 旋钮/推杆/按钮：根据 `(bank, physIdx)` 查找虚拟控件绑定，渲染可编辑控件（滑块、按钮样式），显示 CC/通道等信息
+- 库选择器：若 B > 1，生成下拉菜单，切换时更新显示
+- 校准状态图标：每个旋钮/推杆旁显示未校准/已校准标识
 
-所有可编辑字段监听变化，调用 `context.onVirtualChange`，由上层决定是立即写入设备还是缓存后批量写入。
-
-#### 4.5.4 库选择器
-如果 B > 1，自动生成库切换下拉菜单，切换时更新各控件的显示值（CC、通道）。
-
-#### 4.5.5 校准状态标识
-每个旋钮/推杆控件旁显示校准状态图标（未校准、已校准），点击可触发针对单个控件或全局的校准流程。
+所有交互通过 `context.onVirtualChange` 触发配置修改，由 `ConfigManager` 处理。
 
 ---
 
 ### 4.6 配置管理器 `ConfigManager`
 
 #### 4.6.1 职责
-管理虚拟配置的本地副本，支持编辑、撤销、批量写入。维护“脏”状态，避免不必要的设备写入。
+管理虚拟配置的本地副本，支持编辑、撤销、批量写入。维护“脏”状态。
 
 #### 4.6.2 主要 API
 - `editVirtual(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void`
@@ -309,195 +334,166 @@ interface LeafNode {
 - `saveToDevice(): Promise<void>`
   调用 `DeviceService.writeVirtualConfig`，成功后清除脏标记。
 - `discardChanges(): void`
-  重新从设备读取配置，丢弃本地修改。
+  重新从设备读取配置。
 - `exportConfig(): string`
-  将当前虚拟配置序列化为 JSON 或可打印格式，用于备份。
+  将当前虚拟配置序列化为 JSON 备份。
+
 
 ---
 
 ## 5. 数据流示意
 
-### 5.1 启动与连接
+### 5.1 连接
+
 ```
-用户点击“连接” → MidiTransport.requestAccess()
-→ scanDevices() 发送 0x03 到每个 MIDI 输出端口
-→ 收到匹配的 0x04 响应 → 建立 MidiDeviceHandle
-→ DeviceService.connect(handle)
-   → queryPhysicalInfo() → state.physical
-   → queryLayout() → state.layoutTree
-   → queryVirtualConfig() → state.virtual
-→ UI 更新：LayoutRenderer.render(container, tree, context)
+refreshPorts() → 枚举端口 → 用户选择
+→ sdk.connectAndInitialize(access, inputId, outputId, deviceId)
+  → await MidiTransport.createHandle(...)   (异步打开端口)
+  → 内部 connect(handle) 发送 0x03… 校验
+  → 注册 onstatechange 监听
+  → 返回 DeviceState
 ```
 
-### 5.2 编辑虚拟配置并写入
-```
-用户在 UI 修改 CC 值 → ConfigManager.editVirtual(bank, phys, 'cc', 42)
-→ UI 显示脏标记 → 用户点击“写入设备”
-→ ConfigManager.saveToDevice()
-   → DeviceService.writeVirtualConfig(state.virtual.controls)
-     → ProtocolCodec.buildSetVirtual(...) → 发送 0x0D
-     → 等待 0x0E ACK → 若失败重试 → 成功
-→ 清除脏标记，提示成功
-```
+### 5.2 校准
 
-### 5.3 校准流程
 ```
-用户点击“校准” → DeviceService.startCalibrationWizard(onPrompt)
-  onPrompt('min') → UI 显示“请将控件调至最小值”模态
-  用户确认 → 发送 5 次 0x11（间隔 50ms）→ 取中位数 calMin
-  onPrompt('max') → UI 提示调至最大值
-  用户确认 → 采集 calMax
-  验证范围 → 构建 0x0F 并发送 → 等待 0x10 ACK
-  → 更新状态，UI 刷新校准图标
+startCalibrationWizard(onPrompt)
+  → onPrompt reject CancelSignal → 抛出 CalibrationCancelledError
+  → 采集、写入、刷新
 ```
 
 ---
 
 ## 6. 错误处理策略
 
-库内部分层处理错误：
+| 层级 | 异常 | 处理 |
+|------|------|------|
+| MidiTransport | `TimeoutError`, `ChecksumError`, `DisconnectedError` | 不重试 |
+| DeviceService | `NotConnectedError` | 未连接时操作立即抛出 |
+| DeviceService | 写入 NACK (status=1) | 重试一次，发送相同字节 |
+| 向导 | `CancelSignal` → `CalibrationCancelledError` | UI 处理 |
+| 全局 | `deviceDisconnected` | USB 拔出时自动触发，清理状态 |
 
-| 层级 | 异常类型 | 处理方式 |
-|------|----------|----------|
-| MidiTransport | `TimeoutError`, `ChecksumError` | 自动重试一次，仍失败则向上层抛出 |
-| ProtocolCodec | `ValidationError`, `ParseError` | 立即抛出，包含详细错误码 |
-| DeviceService | 组合上述异常 | 转换为用户友好的错误信息，通过事件通知 UI |
-| UI | - | 捕获异常，显示 toast 提示，并允许用户重试 |
+---
 
-全局错误事件：
+## 7. API 参考（公开接口）
+
 ```typescript
-library.on('error', (err) => { console.error(err); });
-library.on('deviceDisconnected', () => { alert('设备断开'); });
+class LyreConfigSDK {
+  // 传输层
+  requestAccess(): Promise<MIDIAccess>;
+  getAvailablePorts(access: MIDIAccess): { inputs: MIDIPortInfo[], outputs: MIDIPortInfo[] };
+
+  // 服务层
+  async connectAndInitialize(access: MIDIAccess, inputId: string, outputId: string, deviceId: number): Promise<DeviceState>;
+  disconnect(): void;
+
+  getDeviceState(): DeviceState;
+  editVirtual(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void;
+  async saveConfig(): Promise<void>;
+  async startCalibrationWizard(onPrompt: (phase: 'min'|'max') => Promise<void>): Promise<void>;
+  async readRawADC(): Promise<number[]>;
+  exportConfig(): string;
+
+  // 信号/错误实例属性（非静态）
+  readonly CancelSignal: typeof CancelSignal;
+  readonly CalibrationCancelledError: typeof CalibrationCancelledError;
+
+  // 事件订阅，返回取消订阅函数
+  on(event: 'error', handler: (err: Error) => void): () => void;
+  on(event: 'deviceDisconnected', handler: () => void): () => void;
+}
 ```
 
 ---
 
-## 7. 单页工具集成示例
+## 8. 集成示例（完整）
 
 ```html
-<!DOCTYPE html>
-<html>
-<head><title>Lyre 配置工具</title></head>
-<body>
-<div id="app">
-  <button id="btn-connect">连接设备</button>
-  <select id="bank-selector" style="display:none"></select>
-  <div id="layout-container"></div>
-  <button id="btn-write" disabled>写入配置</button>
-  <button id="btn-calibrate">校准</button>
-</div>
-
 <script src="lyre-config-sdk.js"></script>
 <script>
   const sdk = new LyreConfigSDK();
-  let state, renderer;
+  let state, access;
+
+  async function refreshPorts() {
+    access = await sdk.requestAccess();
+    const ports = sdk.getAvailablePorts(access);
+    fillSelect(document.getElementById('input-port'), ports.inputs);
+    fillSelect(document.getElementById('output-port'), ports.outputs);
+  }
+
+  document.getElementById('btn-refresh').onclick = refreshPorts;
 
   document.getElementById('btn-connect').onclick = async () => {
-    const access = await sdk.requestAccess();
-    const devices = await sdk.scanDevices(access);
-    if (devices.length === 0) { alert('未发现 Lyre 设备'); return; }
-    state = await sdk.connect(devices[0]);
-    renderer = new sdk.LayoutRenderer();
-    renderer.render(document.getElementById('layout-container'), state.layoutTree, {
-      deviceState: state,
-      onVirtualChange: (idx, field, val) => {
-        sdk.editVirtual(state.currentBank, idx, field, val);
-        document.getElementById('btn-write').disabled = false;
-      }
-    });
-    if (state.virtual.B > 1) {
-      // 初始化库选择器...
+    const inputId = document.getElementById('input-port').value;
+    const outputId = document.getElementById('output-port').value;
+    const rawId = parseInt(document.getElementById('device-id').value);
+    const deviceId = isNaN(rawId) ? 0 : Math.max(0, Math.min(126, rawId));
+
+    try {
+      state = await sdk.connectAndInitialize(access, inputId, outputId, deviceId);
+      renderer.render(/* ... */);
+    } catch (e) {
+      alert('连接失败：' + e.message);
     }
   };
 
-  document.getElementById('btn-write').onclick = async () => {
-    await sdk.saveConfig();
-    document.getElementById('btn-write').disabled = true;
-    alert('配置已写入');
+  document.getElementById('btn-calibrate').onclick = async () => {
+    try {
+      await sdk.startCalibrationWizard(async (phase) => {
+        return new Promise((resolve, reject) => {
+          const msg = phase === 'min' ? '请将所有推子拉到底' : '请将所有推子推到顶';
+          if (confirm(msg)) resolve();
+          else reject(new sdk.CancelSignal('用户取消'));
+        });
+      });
+      alert('校准完成');
+    } catch (e) {
+      if (e instanceof sdk.CalibrationCancelledError) {
+        // 用户取消
+      } else {
+        alert('校准失败：' + e.message);
+      }
+    }
   };
 
-  document.getElementById('btn-calibrate').onclick = async () => {
-    await sdk.startCalibrationWizard((phase) => {
-      alert(phase === 'min' ? '请将推子拉到底' : '请将推子推到顶');
-    });
-    alert('校准完成');
-  };
+  // 设备异常断开监听
+  sdk.on('deviceDisconnected', () => {
+    alert('设备已断开');
+  });
+
+  refreshPorts();
 </script>
-</body>
-</html>
 ```
 
 ---
 
-## 8. API 参考（简要清单）
-
-**LyreConfigSDK 类**
-
-| 方法 | 说明 |
-|------|------|
-| `requestAccess()` | 获取 MIDIAccess |
-| `scanDevices(access, filter?)` | 扫描并识别设备 |
-| `connect(deviceHandle)` | 连接并读取全部配置 |
-| `disconnect()` | 断开连接 |
-| `getDeviceState()` | 返回当前 DeviceState |
-| `editVirtual(bank, physIdx, field, value)` | 编辑虚拟控件 |
-| `saveConfig()` | 写入虚拟配置到设备 |
-| `startCalibrationWizard(onPrompt)` | 执行校准向导 |
-| `readRawADC()` | 查询 ADC 原始值（调试） |
-| `exportConfig()` | 导出配置 JSON |
-
-**事件**
-
-| 事件 | 参数 |
-|------|------|
-| `'connected'` | `deviceHandle` |
-| `'disconnected'` | - |
-| `'configChanged'` | `virtualControls` |
-| `'error'` | `{code, message}` |
-
----
-
-## 9. 实现注意事项
-
-1. **缓冲与同步**：MidiTransport 内部维护一个请求队列，确保同一时刻只有一个命令在等待响应（避免响应混淆）。在收到匹配响应之前，后续请求排队。
-2. **SysEx 长度**：按照协议最大值（770 字节）分配缓冲区。
-3. **数据位约束**：所有构建的 SysEx 消息必须保证数据字节 bit7=0，构建函数内部自动处理。
-4. **按钮虚拟控件**：UI 渲染时检查按钮是否出现在虚拟控件表中，以此决定显示为可配置的 MIDI 控件还是固件功能按钮（不可编辑）。
-5. **错误恢复**：写入虚拟配置时，如果设备返回 NACK，尝试重新读取虚拟配置，检查是否因设备端状态不一致导致，并提示用户。
-6. **版本兼容**：检查 `protocolVersion` 是否 ≥ 0x16，低于则提示升级固件。
-
----
-
-## 10. 附录：关键数据结构 TypeScript 定义
+## 9. 导出配置 JSON Schema
 
 ```typescript
-interface PhysDesc {
-  mux: number;         // 0x00 = 直连
-  channel: number;     // ADC 通道
-  calMin: number;      // 解码后的 14-bit
-  calMax: number;
-}
-
-interface VirtualCtrl {
-  bank: number;
-  physIdx: number;
-  cc: number;
-  channel: number;
-}
-
-interface DeviceState {
-  physical: {
+interface ConfigExport {
+  version: string;          // "2.6"
+  exportedAt: string;       // ISO8601
+  device: {
+    deviceId: number;
     N: number;
-    protocolVersion: number;
-    controls: PhysDesc[];
-  };
-  layoutTree: LayoutNode;
-  virtual: {
     B: number;
     V: number;
-    controls: VirtualCtrl[];
   };
+  virtualControls: VirtualCtrl[];
+  calibration: {            // 长度 N，物理索引顺序
+    min: number;
+    max: number;
+  }[];
 }
 ```
 
-此设计完整覆盖协议要求，分层清晰，能直接作为开发单页配置工具的蓝图。
+---
+
+## 10. 版本历史
+
+| 版本 | 主要变更 |
+|------|----------|
+| v1.6 | `createHandle` 改为异步，确保端口打开；增加 `NotConnectedError` 及操作前置检查；`editVirtual` 即时校验；明确 `deviceDisconnected` 触发条件与事件系统细节；完善原子性清理。 |
+
+---
