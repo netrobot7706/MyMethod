@@ -1,4 +1,4 @@
-# 上位机 JS 库详细设计 v1.8
+# 上位机 JS 库详细设计 v1.9
 
 ## 1. 概述
 
@@ -75,10 +75,10 @@ interface MidiDeviceHandle {
   验证 deviceId 范围、打开端口（原子性：output 打开失败时关闭 input），注册 onmidimessage。
 
 - `sendSysex(device, msg, responseCmd?, timeout?): Promise<Uint8Array>`  
-  发送并等待匹配响应。超时逻辑同 v1.7。
+  发送并等待匹配响应。超时逻辑同 v1.8。
 
 - `disconnect(device: MidiDeviceHandle): void`  
-  清理：reject pending 为 DisconnectedError，移除监听，调用 `input.close().catch(()=>{})` 和 `output.close().catch(()=>{})`，清空队列。
+  清理：reject pending 为 `DisconnectedError`，移除监听，调用 `input.close().catch(()=>{})` 和 `output.close().catch(()=>{})`，清空队列。
 
 #### 4.1.4 错误类
 
@@ -93,7 +93,66 @@ class MidiAccessDeniedError extends Error {}
 
 ### 4.2 协议编解码器 `ProtocolCodec`
 
-同 v1.7，无变更。
+**职责**：提供所有 SysEx 命令的构建、解析、验证函数。
+
+#### 4.2.1 常量
+
+```typescript
+const SYSEX_START = 0xF0;
+const SYSEX_END   = 0xF7;
+const MANUFACTURER_ID = 0x7D;
+const PROTOCOL_VERSION = 0x16;
+
+const CMD_QUERY_PHYSICAL      = 0x03;
+const CMD_PHYSICAL_RESPONSE   = 0x04;
+const CMD_QUERY_LAYOUT        = 0x07;
+const CMD_LAYOUT_RESPONSE     = 0x08;
+const CMD_QUERY_VIRTUAL       = 0x0B;
+const CMD_VIRTUAL_RESPONSE    = 0x0C;
+const CMD_SET_VIRTUAL         = 0x0D;
+const CMD_SET_VIRTUAL_ACK     = 0x0E;
+const CMD_SET_CALIBRATION     = 0x0F;
+const CMD_CALIBRATION_ACK     = 0x10;
+const CMD_QUERY_ADC_RAW       = 0x11;
+const CMD_ADC_RAW_RESPONSE    = 0x12;
+```
+
+#### 4.2.2 工具函数
+
+- `rolandChecksum(data: Uint8Array | number[]): number`
+- `computeMessageChecksum(fullMsg: Uint8Array): number`  
+  自动提取 `msg.slice(1, msg.length - 2)`。
+- `encode14bit(value: number): [number, number]` 输入 0–16383。
+- `decode14bit(mid: number, lo: number): number`
+- `validateSysEx(msg: Uint8Array, expectedCmd?, expectedDeviceId?): boolean`
+
+#### 4.2.3 命令构建
+
+| 方法 | 说明 |
+|------|------|
+| `buildQueryPhysical(deviceId)` | 0x03 |
+| `buildQueryLayout(deviceId)` | 0x07 |
+| `buildQueryVirtual(deviceId)` | 0x0B |
+| `buildSetVirtual(deviceId, B, V, controls)` | 0x0D，字段非法抛 `ValidationError` |
+| `buildSetCalibration(deviceId, N, calibrations)` | 0x0F，接收 `{min,max}[]` |
+| `buildQueryRawADC(deviceId)` | 0x11 |
+
+#### 4.2.4 响应解析
+
+| 方法 | 输出 | 说明 |
+|------|------|------|
+| `parsePhysicalResponse(msg)` | `{N, protocolVersion, physControls}` | 校验和错误抛 `ChecksumError` |
+| `parseLayoutResponse(msg)` | `{declaredLength, treeBytes}` | 校验和错误同上 |
+| `parseVirtualResponse(msg)` | `{B, V, controls}` | 只解析，不做约束校验 |
+| `parseAck(msg, expectedCmd)` | `{status: number}` | status=0/1/2 |
+| `parseRawADCResponse(msg)` | `{N, rawValues}` | 14‑bit 解码 |
+
+**0x04 响应字节偏移表**（同 v1.2）。
+
+#### 4.2.5 数据验证
+
+- `validateVirtualConfig(controls, B, V, N)`：检查长度、字段范围、bit7、唯一性。
+- `validateCalibrationData(calibrations, N)`：检查范围、max>min、编码后 bit7。
 
 ---
 
@@ -115,47 +174,46 @@ interface DeviceState {
 }
 ```
 
-**数据所有权**（v1.8 新增说明）：
-- `DeviceState.virtual.controls` 存储**最后一次从设备读取的值**（只读快照），连接后由 `queryVirtualConfig` 填充，写入成功后刷新。
-- 用户编辑通过 `ConfigManager` 维护一份独立的**可写副本**，`getDeviceState().virtual.controls` 不反映未保存的修改。若需获取当前工作副本，使用 `ConfigManager.getCurrentControls()`。
+**数据所有权**：
+- `DeviceState.virtual.controls` 存储**最后一次从设备读取/写入的值**（只读快照）。
+- 用户编辑通过 `ConfigManager` 维护独立的可写副本，通过 `getActiveControls(bank)` 获取当前编辑状态。
+- `getDeviceState().virtual.controls` 不反映未保存的修改。
 
 #### 4.3.3 核心方法
 
 - **`async connectAndInitialize(access, inputId, outputId, deviceId): Promise<DeviceState>`**  
-  1. 如果 `connected === true`，先调用 `this.disconnect()` 自动断开旧连接。**注意：断开后若新连接失败，旧连接不会恢复，用户需重新选择端口**。  
-  2. 创建句柄，内部 `connect()` 发送 0x03 等。  
-  3. 使用 `access.addEventListener('statechange', ...)` 监听端口移除，匹配当前端口 ID 且 state 为 disconnected 时，触发断开逻辑。  
+  1. 如果已连接，先调用 `this.disconnect()`（自动断开旧连接）。**注意：断开后若新连接失败，旧连接不会恢复**。
+  2. 创建句柄，内部 `connect()` 发送 0x03 等。
+  3. 使用 `access.addEventListener('statechange', ...)` 监听端口移除，匹配当前端口 ID 且状态为 disconnected 时：
+     - 先发出 `deviceDisconnected` 事件（UI 可设置断开标志）
+     - 再执行 `disconnect()` 清理资源。
   4. 返回 `DeviceState`。
 
-- **USB 拔出事件处理顺序**（v1.8 明确）：  
-  当 `_onStateChange` 检测到设备端口移除时，按以下顺序操作：
-  1. 调用 `this._emit('deviceDisconnected')`（先通知 UI，使其可标记"正在断开"）
-  2. 再调用 `this.disconnect()`（内部会 reject 所有 pending 请求为 `DisconnectedError`）  
-  这样 UI 层可在收到 `deviceDisconnected` 事件时设置标志，忽略随后到来的 `DisconnectedError`，避免双重提示。
-
 - **`disconnect(): void`**  
-  用户主动断开。不触发 `deviceDisconnected` 事件。
+  用户主动断开。不触发 `deviceDisconnected` 事件。内部调用 `MidiTransport.disconnect(state.deviceHandle!)` 并重置状态。
 
 - **`async writeVirtualConfig(controls): Promise<void>`**  
-  重试策略同前。
+  重试策略同前（status=1 重试一次）。
 
 - **`async startCalibrationWizard(onPrompt): Promise<void>`**  
-  **新增前置检查**：若 `!this.state.connected`，立即抛出 `NotConnectedError`，避免用户操作一半才发现。  
-  其余流程同前。
+  前置检查：未连接直接抛 `NotConnectedError`。其余流程同前。
 
 - **`async readRawADC(): Promise<number[]>`**  
-  连接检查同前。
+  前置检查连接。
 
 - **`editVirtual(bank, physIdx, field, value): void`**  
-  即时验证，修改 `ConfigManager` 的可写副本。
+  即时验证，修改 ConfigManager 的可写副本。
 
 - **`async saveConfig(): Promise<void>`**  
-  委托给 `ConfigManager.saveToDevice()`，后者检查脏标记，若无修改则跳过；否则调用 `DeviceService.writeVirtualConfig(currentControls)` 写入设备，成功后刷新 `DeviceState.virtual.controls` 快照并清除脏标记。
+  委托给 `ConfigManager.saveToDevice()`，后者检查脏标记，若无修改则跳过；否则调用 `writeVirtualConfig(currentControls)` 写入设备，成功后**将写入的副本直接赋值给 `DeviceState.virtual.controls`**（无需重新查询，设备无额外处理），并清除脏标记。
 
 - **`exportConfig(): string`**  
   未连接抛 `NotConnectedError`。返回 JSON 格式见 §9。
 
-#### 4.3.4 错误类
+- **`getActiveControls(bank: number): VirtualCtrl[]`**  
+  返回指定库的当前虚拟控件配置（含未保存的编辑），供 UI 渲染使用。内部委托给 ConfigManager。
+
+#### 4.3.4 错误类及事件
 
 ```typescript
 class CancelSignal extends Error {}
@@ -164,6 +222,10 @@ class ProtocolViolationError extends Error {}
 class NotConnectedError extends Error {}
 class ValidationError extends Error {}
 ```
+
+**事件**：
+- `error` 事件：仅在**非用户主动发起的后台操作**失败时触发（如 USB 拔出导致的 pending 请求 reject 为 `DisconnectedError`）。用户主动调用（`saveConfig`、`startCalibrationWizard` 等）的错误通过 Promise reject 传播，**不触发** `error` 事件。
+- `deviceDisconnected` 事件：仅在物理断开时触发。
 
 ---
 
@@ -179,7 +241,7 @@ type LayoutNode = ContainerNode | LeafNode;
 interface ContainerNode {
   type: 'hbox' | 'vbox' | 'grid';
   children: LayoutNode[];
-  cols?: number;   // 仅 grid
+  cols?: number;
   rows?: number;
 }
 
@@ -191,109 +253,123 @@ interface LeafNode {
 
 #### 4.4.3 解析算法
 - 静态方法 `parse(treeBytes: Uint8Array, declaredLength: number): LayoutNode`
-- 使用游标 `pos` 在 `treeBytes` 上递归读取，**严格以 `declaredLength` 为边界**。
-- 读取前检查 `pos < declaredLength`，越界则抛出 `MalformedTreeError`。
-- 解析完成后检查 `pos === declaredLength`，不等则抛出 `MalformedTreeError`。
-- 容器节点：读取子节点数量，递归构建子节点。Grid 额外校验 `cols * rows <= 127` 及子节点数量一致性。
-- 叶子节点：读取物理索引。
-- 未知容器节点（0x01–0x0F）：抛出 `UnknownContainerError`。
-- 未知叶子节点（0x10–0x3F）：消耗索引字节，生成类型为 `'unknown'` 的叶子节点。
+- 严格以 `declaredLength` 为边界：读取前检查 `pos < declaredLength`，完成后检查 `pos === declaredLength`，否则抛出 `MalformedTreeError`。
+- 容器节点：读取子节点数/行列数，递归构建子节点；Grid 校验 `cols * rows <= 127`。
+- 未知容器节点抛出 `UnknownContainerError`；未知叶子节点生成 `'unknown'` 类型节点。
 
 ---
 
 ### 4.5 UI 渲染模块 `LayoutRenderer`
 
 #### 4.5.1 职责
-根据 `LayoutNode` 树和物理/虚拟配置，生成对应的 DOM 元素，并绑定交互事件。
+根据布局树和设备/虚拟配置生成 DOM 元素，并绑定交互。
 
 #### 4.5.2 核心方法
 - `render(container: HTMLElement, layout: LayoutNode, context: RenderContext): void`
-  清空容器，递归遍历布局树，生成对应的 HTML 结构。
 
-`RenderContext` 提供：
-- `deviceState: DeviceState`
-- `onVirtualChange(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void`
-- `onCalibrate(): void`
+**`RenderContext`** 接口：
+```typescript
+interface RenderContext {
+  deviceState: DeviceState;
+  getActiveControls(bank: number): VirtualCtrl[];  // 返回指定库的当前配置（含未保存编辑）
+  onVirtualChange(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void;
+  onCalibrate(): void;
+}
+```
+
+渲染时使用 `context.getActiveControls(currentBank)` 获取显示数据，而非 `DeviceState.virtual.controls`。
 
 #### 4.5.3 渲染规则
-- 水平容器 → `display: flex; flex-direction: row;`
-- 垂直容器 → `display: flex; flex-direction: column;`
-- 网格容器 → CSS Grid，行列数由属性决定
-- 旋钮/推杆/按钮：根据 `(bank, physIdx)` 查找虚拟控件绑定，渲染可编辑控件（滑块、按钮样式），显示 CC/通道等信息
-- 库选择器：若 B > 1，生成下拉菜单，切换时更新显示
-- 校准状态图标：每个旋钮/推杆旁显示未校准/已校准标识
+- 容器：HBox/VBox 使用 flex 布局，Grid 使用 CSS Grid。
+- 叶子控件：根据 `(bank, physIdx)` 查找对应的虚拟控件，显示滑块/按钮样式及可编辑的 CC/通道。
+- 库选择器：若 B > 1，生成下拉菜单，切换时重新渲染控件区。
+- 校准状态图标：对旋钮/推杆显示，依据 `DeviceState.calibration.status` 和具体控件的数据。
 
-所有交互通过 `context.onVirtualChange` 触发配置修改，由 `ConfigManager` 处理。
-
+所有编辑操作通过 `context.onVirtualChange` 通知上层。
 
 ---
 
 ### 4.6 配置管理器 `ConfigManager`
 
-- 维护虚拟控件配置的可写副本（`controlsCopy`）。
-- `editVirtual` 修改该副本并标记脏。
-- `saveToDevice()` 调用 `DeviceService.writeVirtualConfig(controlsCopy)`，成功则清除脏标记。
-- 不再包含 `exportConfig` 方法。
-
 #### 4.6.1 职责
-管理虚拟配置的本地副本，支持编辑、撤销、批量写入。维护“脏”状态。
+维护虚拟控件配置的可写副本，管理脏状态，提供编辑与批量保存。
 
 #### 4.6.2 主要 API
-- `editVirtual(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void`
-  修改内存中的虚拟配置，标记脏。
-- `saveToDevice(): Promise<void>`
-  调用 `DeviceService.writeVirtualConfig`，成功后清除脏标记。
-- `discardChanges(): void`
-  重新从设备读取配置。
-- `exportConfig(): string`
-  将当前虚拟配置序列化为 JSON 备份。
+- `editVirtual(bank, physIdx, field, value): void`  
+  修改可写副本，标记脏。
+
+- `saveToDevice(): Promise<void>`  
+  调用 `DeviceService.writeVirtualConfig(controlsCopy)`，成功后清除脏标记。
+
+- `discardChanges(): void`  
+  丢弃本地修改，重新从设备加载当前值（调用 0x0B 刷新 `DeviceState.virtual.controls` 并重置副本）。
+
+- `getControlsCopy(bank: number): VirtualCtrl[]`  
+  返回指定库的当前可写副本（内部使用，供 `getActiveControls` 调用）。
+
+本模块**不包含** `exportConfig` 方法，导出功能由 `DeviceService` 统一提供。
+
 ---
 
 ## 5. 数据流示意
 
-### 5.1 连接
+### 5.1 连接与端口监听
 ```
 sdk.connectAndInitialize(...) 
-  → 若已连接，自动断开旧连接（注意：失败不恢复旧连接）
-  → createHandle → connect → 返回 DeviceState
+  → 若已连接则断开旧连接（注意：失败不恢复）
+  → createHandle → connect → 注册 onstatechange
+  → 返回 DeviceState
 ```
 
-### 5.2 编辑写入
+### 5.2 编辑虚拟配置
 ```
-editVirtual → ConfigManager 修改副本
-saveConfig → ConfigManager.saveToDevice() → writeVirtualConfig(副本) → 成功刷新 DeviceState
+UI 修改 → sdk.editVirtual(...) → ConfigManager 副本更新
+UI 从 context.getActiveControls(bank) 获取最新值显示
+
+用户保存 → sdk.saveConfig() → ConfigManager.saveToDevice()
+  → writeVirtualConfig(副本) → 成功：副本赋给 DeviceState.virtual.controls，清脏
 ```
 
 ---
 
 ## 6. 错误处理策略
 
-| 层级 | 异常 | 处理 |
-|------|------|------|
-| MidiTransport | `TimeoutError`, `ChecksumError`, `DisconnectedError` | 不重试 |
-| DeviceService | `NotConnectedError` | 操作前置检查立即抛出 |
-| DeviceService | 写入 NACK (status=1) | 重试一次 |
-| 向导 | `CancelSignal` → `CalibrationCancelledError` | UI 处理 |
-| USB 拔出 | 先 `deviceDisconnected` 事件，后 `DisconnectedError` | UI 应优先处理前者 |
+| 场景 | 处理方式 |
+|------|----------|
+| 用户主动调用失败 | Promise reject 相应错误，不触发全局 `error` 事件 |
+| USB 拔出 | 触发 `deviceDisconnected` 事件 → 内部清理，pending 请求 reject `DisconnectedError`（触发全局 `error` 事件，UI 可忽略） |
+| 写入 NACK (status=1) | 自动重试一次 |
+| 未连接时操作 | 立即抛 `NotConnectedError` |
+| 校准取消 | 抛 `CalibrationCancelledError` |
 
 ---
 
-## 7. API 参考
+## 7. API 参考（公开接口）
 
 ```typescript
 class LyreConfigSDK {
+  // 传输层
   requestAccess(): Promise<MIDIAccess>;
   getAvailablePorts(access: MIDIAccess): { inputs: MIDIPortInfo[], outputs: MIDIPortInfo[] };
-  async connectAndInitialize(access, inputId, outputId, deviceId): Promise<DeviceState>;
+
+  // 服务层
+  async connectAndInitialize(access: MIDIAccess, inputId: string, outputId: string, deviceId: number): Promise<DeviceState>;
   disconnect(): void;
+
   getDeviceState(): DeviceState;
-  editVirtual(bank, physIdx, field, value): void;
+  getActiveControls(bank: number): VirtualCtrl[];               // 含未保存编辑
+  editVirtual(bank: number, physIdx: number, field: 'cc'|'channel', value: number): void;
   async saveConfig(): Promise<void>;
   async startCalibrationWizard(onPrompt: (phase: 'min'|'max') => Promise<void>): Promise<void>;
   async readRawADC(): Promise<number[]>;
   exportConfig(): string;
+
+  // 信号/错误实例属性
   readonly CancelSignal: typeof CancelSignal;
   readonly CalibrationCancelledError: typeof CalibrationCancelledError;
+  readonly DisconnectedError: typeof DisconnectedError;         // v1.9 新增
+
+  // 事件订阅，返回取消订阅函数
   on(event: 'error', handler: (err: Error) => void): () => void;
   on(event: 'deviceDisconnected', handler: () => void): () => void;
 }
@@ -301,22 +377,34 @@ class LyreConfigSDK {
 
 ---
 
-## 8. 集成示例（重要更新）
+## 8. 集成示例（关键部分）
 
 ```javascript
-// 监听设备断开，设置标志避免双重提示
+const sdk = new LyreConfigSDK();
 let isDisconnecting = false;
+
+// 监听设备物理断开
 sdk.on('deviceDisconnected', () => {
   isDisconnecting = true;
   alert('设备已断开');
 });
-sdk.on('error', (err) => {
-  if (isDisconnecting && err instanceof sdk.DisconnectedError) return; // 忽略
-  alert('错误: ' + err.message);
-});
-```
 
-其余同前。
+// 全局错误处理（忽略断开后的 DisconnectedError）
+sdk.on('error', (err) => {
+  if (isDisconnecting && err instanceof sdk.DisconnectedError) return;
+  console.error(err);
+});
+
+// 连接
+async function connect() {
+  const access = await sdk.requestAccess();
+  const ports = sdk.getAvailablePorts(access);
+  // ... 用户选择端口和ID ...
+  const state = await sdk.connectAndInitialize(access, inputId, outputId, deviceId);
+  // 渲染界面时使用 getActiveControls(currentBank) 获取控件数据
+  isDisconnecting = false;
+}
+```
 
 ---
 
@@ -338,8 +426,8 @@ interface ConfigExport {
 
 | 版本 | 主要变更 |
 |------|----------|
-| v1.7 | 修复 SysEx 权限、重连自动断开、onstatechange 事件处理、close 错误忽略、移除重复 exportConfig |
-| v1.8 | 明确 USB 拔出时事件顺序（先 deviceDisconnected 后 DisconnectedError）；补充连接失败不恢复旧连接说明；明确 saveConfig 调用链；增加校准向导连接检查；定义 DeviceState 数据所有权（快照 vs 可写副本） |
+| v1.8 | 完善事件顺序、数据所有权、调用链 |
+| v1.9 | 暴露 `DisconnectedError`；明确快照刷新方式；定义 `error` 事件触发范围；为 `LayoutRenderer` 增加 `getActiveControls` 上下文，明确渲染数据源；修正 `ConfigManager` 过时方法。 |
 
 ---
 
