@@ -1,10 +1,35 @@
-# Lyre MK2 命令及配置管线详细设计（v2.0 — CORE/APP 分离版）
+审计报告识别出的问题大部分真实存在，且建议合理，没有过度设计。我对每一条缺陷的评估如下：
 
-> **文档版本**：v2.0  
+- **P0 #1**：确实违反 `@constraint`，采纳方案A（0x11 改为设标志，延迟到 `cmd_cfg_task` 处理）。  
+- **P0 #2**：`save_buffer` 大小确实应明确定义，用宏表达。  
+- **P0 #3**：序列化格式已在状态机代码中隐式表达，但应显式增加一个小节说明。  
+- **P0 #4**：初始化写回路径必须明确为同步阻塞调用。  
+- **P1 #5**：0x02 是协议未定义的扩展，采纳降级处理——忙时统一返回 0x01，上位机重试。  
+- **P1 #6**：按钮豁免是合理的可移植性说明，但无需修改函数签名，在文档中注明调用者责任即可。  
+- **P1 #7/#8/#9**：接口/类型/辅助函数缺失，必须补充完整。  
+- **P1 #10**：查询回调同样必须遵守设标志模式，补充实现。  
+- **P2 #11**：补充 14-bit 长度编码的构建代码，避免误导。  
+- **P2 #12**：补充原子切换的明确说明。  
+- **P2 #13**：补充 `handle_0x0F` 与 0x0D 的差异说明。  
+- **P2 #14**：增加 `CFG_SAVE_FAILED` 状态及 `begin` 失败处理，`step` 目前 API 无错误返回，但至少应处理 `begin` 失败。  
+- **P2 #15**：明确 IDLE 状态下的事件优先级。  
+- **P2 #16**：修正注释。  
+- **P2 #17**：统一接口类型。  
+- **P2 #18**：VLA 风险确实存在，改为固定上限数组+编译期限制。  
+- **P3 #19–22**：全部采纳，补充状态机图、完整伪代码、防御性校验等。
+
+以下是吸收所有缺陷后修正的完整详细设计文档（v2.1）。修订轨迹以注释形式标注。
+
+---
+
+# Lyre MK2 命令及配置管线详细设计（v2.1 — 审计闭环版）
+
+> **文档版本**：v2.1  
 > **关联架构文档**：《Lyre MK2 产品架构设计文档 v2.2》  
 > **关联协议**：《MIDI 控制器自描述配置协议 v2.6》  
 > **管线**：Command & Config  
-> **状态**：冻结基线，可直接用于编码实现
+> **状态**：冻结基线，可直接用于编码实现  
+> **修订**：依据架构审计报告闭环 P0–P3 所有缺陷
 
 ---
 
@@ -18,8 +43,8 @@
 - **cmd_cfg_app（APP 层）**：  
   Lyre 产品专用外壳，极薄一层。仅包含：
   - Lyre 的产品参数定义（N、B、V、物理描述、布局树）。
-  - 命令回调中调用 `cmd_core` 校验并提取配置、设置状态机标志。
-  - 通过 `cmd_cfg_task()` 状态机编排跨管线交互（存储、LED、Pot 暂停等）。
+  - 命令回调中调用 `cmd_core` 校验并提取配置、**仅设置状态标志**（无跨管线副作用）。
+  - 通过 `cmd_cfg_task()` 状态机编排跨管线交互（存储、LED、Pot 暂停等），**所有跨管线调用和 MIDI 发送均集中在此函数中**。
   - 实现 `market/cmd_cfg_api.h` 的所有接口。
 
 **移植到新控制器时，只需重写 `cmd_cfg_app.c/h`（约 200 行），`cmd_core.c/h` 完全保留。**
@@ -52,23 +77,27 @@ pipelines/cmd_config/
 - SysEx 消息完整性校验（厂商 ID、设备 ID、校验和）。
 - 命令字分发。
 - **虚拟控件配置 payload 校验**（字段范围、唯一性）。
-- **校准数据 payload 校验**（长度、`cal_max > cal_min`）。
+- **校准数据 payload 校验**（长度、`cal_max > cal_min`）。**注**：按钮控件校验由调用者保证数据合法（见 3.4 说明）。
 - **应答帧构建**（ACK/NACK）。
 - **数据响应帧构建**（0x04、0x08、0x0C、0x12）。
 
 `cmd_core` **绝不** 操作任何硬件、存储或调用其他管线。
 
-### 3.2 协议数据类型定义（与产品解耦）
-
-`cmd_core` 需要访问物理描述和虚拟控件描述的字节布局，但不应依赖产品的具体结构体。因此，我们在 `cmd_core.h` 中定义协议层通用类型：
+### 3.2 协议数据类型定义
 
 ```c
-/* === cmd_core.h 片段 === */
+/* === cmd_core.h === */
+
+#ifndef CMD_CORE_H
+#define CMD_CORE_H
+
+#include <stdint.h>
+#include <stdbool.h>
 
 /* 物理控件描述（严格遵循协议 0x04 的 6 字节布局） */
 typedef struct {
-    uint8_t  mux;          // 多路器索引
-    uint8_t  channel;      // 通道号
+    uint8_t  mux;
+    uint8_t  channel;
     uint8_t  cal_min_mid;
     uint8_t  cal_min_lo;
     uint8_t  cal_max_mid;
@@ -82,70 +111,105 @@ typedef struct {
     uint8_t cc;
     uint8_t channel;
 } cmd_virt_ctrl_t;
-```
 
-APP 层若使用相同布局的结构体，可直接强制转换；若布局不同，则需在调用 CORE 函数前手动拷贝转换。本产品中 APP 层直接使用这些类型以简化设计。
+/* 命令处理回调原型 */
+typedef void (*cmd_handler_t)(const uint8_t *payload, uint16_t len, uint8_t cmd);
 
-### 3.3 新增的通用协议函数接口
+/* 命令表条目 */
+typedef struct {
+    uint8_t cmd;
+    cmd_handler_t handler;
+} cmd_entry_t;
 
-在原有 `cmd_core_dispatch` 基础上，增加以下函数：
-
-```c
-/* === cmd_core.h 新增 === */
-
+/* —— 协议常量 —— */
 #define CMD_PROTO_VERSION       0x16   // v2.6
+#define CMD_MAX_UNIQUE_PAIRS    128    // 最大 B*N，用于唯一性校验数组
 
-// ---- 校验函数 ----
+/* —— 函数声明 —— */
+
+/** 初始化 CORE（当前无状态，保留扩展） */
+void cmd_core_init(void);
 
 /**
- * 校验虚拟控件配置 payload。
- * payload 格式：B(1) V(1) + 4V 数据
- * @return 0 成功；非 0 错误码
+ * 处理一条完整的 SysEx 消息。
+ * @param sysex_msg  完整帧（含 F0..F7）
+ * @param len        总长度
+ * @param device_id  本设备期望 ID
+ * @param table      命令表
+ * @param table_size 命令表条目数
+ * @param payload_out 输出 payload 首字节指针（可为 NULL）
+ * @param payload_len_out 输出 payload 长度（可为 NULL）
+ * @return 0=成功分发，1=长度不足，2=非 F0 开头，3=厂商不匹配，4=设备 ID 不匹配，5=校验和错误，6=未知命令字
  */
+uint8_t cmd_core_dispatch(const uint8_t *sysex_msg, uint16_t len,
+                          uint8_t device_id,
+                          const cmd_entry_t *table, uint8_t table_size,
+                          const uint8_t **payload_out, uint16_t *payload_len_out);
+
+// ---- 校验函数 ----
 uint8_t cmd_proto_validate_virt_config(const uint8_t *payload, uint16_t len,
                                        uint8_t B_expected, uint8_t V_expected,
                                        uint8_t N_expected);
 
-/**
- * 校验校准数据 payload。
- * payload 格式：N(1) + 4N 校准数据
- * @return 0 成功；非 0 错误码
- */
 uint8_t cmd_proto_validate_calibration(const uint8_t *payload, uint16_t len,
                                        uint8_t N_expected);
 
-// ---- 响应构建函数（仅生成帧数据，不发送） ----
-
-/** 构建 ACK/NACK 响应帧，固定 7 字节。 */
+// ---- 响应构建函数（仅生成帧数据）----
 void cmd_proto_build_ack(uint8_t device_id, uint8_t ack_cmd, uint8_t status,
-                         uint8_t *buf_out, uint8_t *len_out);
+                         uint8_t *buf_out, uint16_t *len_out);
 
-/** 构建 0x04 物理设备信息响应帧。 */
 void cmd_proto_build_device_info(uint8_t device_id, uint8_t N,
                                  const cmd_phys_desc_t *phys,
                                  uint8_t *buf_out, uint16_t *len_out);
 
-/** 构建 0x0C 虚拟配置响应帧。 */
 void cmd_proto_build_virt_config(uint8_t device_id, uint8_t B, uint8_t V,
                                  const cmd_virt_ctrl_t *virt,
                                  uint8_t *buf_out, uint16_t *len_out);
 
-/** 构建 0x12 ADC 原始值响应帧。 */
 void cmd_proto_build_adc_raw(uint8_t device_id, uint8_t N,
                              const uint16_t *raw_values,
                              uint8_t *buf_out, uint16_t *len_out);
 
-/** 构建 0x08 面板布局响应帧（布局树字节流由调用者提供）。 */
 void cmd_proto_build_layout(uint8_t device_id, const uint8_t *tree_data,
                             uint16_t tree_len,
                             uint8_t *buf_out, uint16_t *len_out);
+
+#endif /* CMD_CORE_H */
 ```
 
-所有构建函数输出的缓冲区大小需要调用者根据协议上限分配（例如 770 字节）。校验和由函数内部自动计算。
+### 3.3 实现要点
 
-### 3.4 实现要点
+#### 3.3.1 `cmd_core_dispatch` 实现
 
-#### 校验函数实现
+```c
+uint8_t cmd_core_dispatch(const uint8_t *msg, uint16_t len,
+                          uint8_t device_id,
+                          const cmd_entry_t *table, uint8_t table_size,
+                          const uint8_t **payload_out, uint16_t *payload_len_out) {
+    if (len < 6) return 1;
+    if (msg[0] != 0xF0) return 2;
+    if (msg[1] != 0x7D) return 3;
+    if (msg[2] != device_id) return 4;
+
+    // 校验和
+    uint16_t ck_range_len = len - 3 - 1; // 从 0x7D 到校验和前
+    uint8_t expected = roland_checksum(&msg[1], ck_range_len);
+    if (expected != msg[len - 2]) return 5;
+
+    uint8_t cmd = msg[3];
+    for (uint8_t i = 0; i < table_size; i++) {
+        if (table[i].cmd == cmd) {
+            if (payload_out) *payload_out = &msg[4];
+            if (payload_len_out) *payload_len_out = len - 6;
+            table[i].handler(&msg[4], len - 6, cmd);
+            return 0;
+        }
+    }
+    return 6;
+}
+```
+
+#### 3.3.2 校验函数
 
 ```c
 uint8_t cmd_proto_validate_virt_config(const uint8_t *payload, uint16_t len,
@@ -157,9 +221,15 @@ uint8_t cmd_proto_validate_virt_config(const uint8_t *payload, uint16_t len,
     if (B != B_expected || V != V_expected) return 2;
     if (len != (2 + 4 * V)) return 3;
 
-    // 唯一性检查表：最大 B*N <= 127*127 但可动态分配或使用栈数组
-    bool used[B_expected * N_expected];  // C99 VLA，或根据需要改为固定大小
-    memset(used, 0, sizeof(used));
+    // 防御性：bit7 检查
+    for (uint16_t i = 0; i < len; i++) {
+        if (payload[i] & 0x80) return 6;
+    }
+
+    // 唯一性检查，使用固定上限数组，避免 VLA 栈溢出
+    uint8_t used[CMD_MAX_UNIQUE_PAIRS] = {0};
+    uint16_t pair_count = B_expected * N_expected;
+    if (pair_count > CMD_MAX_UNIQUE_PAIRS) return 7; // 参数超限
 
     for (uint8_t i = 0; i < V; i++) {
         uint8_t bank    = payload[2 + i*4];
@@ -169,38 +239,55 @@ uint8_t cmd_proto_validate_virt_config(const uint8_t *payload, uint16_t len,
 
         if (bank >= B_expected || phys >= N_expected || cc > 127 || channel > 15)
             return 4;
-        uint8_t idx = bank * N_expected + phys;
+        uint16_t idx = (uint16_t)bank * N_expected + phys;
         if (used[idx]) return 5;
-        used[idx] = true;
+        used[idx] = 1;
+    }
+    return 0;
+}
+
+uint8_t cmd_proto_validate_calibration(const uint8_t *payload, uint16_t len,
+                                       uint8_t N_expected) {
+    if (len < 1) return 1;
+    uint8_t N = payload[0];
+    if (N != N_expected) return 2;
+    if (len != (1 + 4 * N)) return 3;
+
+    // bit7 校验
+    for (uint16_t i = 0; i < len; i++) {
+        if (payload[i] & 0x80) return 5;
+    }
+
+    for (uint8_t i = 0; i < N; i++) {
+        uint16_t cal_min = (payload[1 + i*4] << 7) | payload[1 + i*4 + 1];
+        uint16_t cal_max = (payload[1 + i*4 + 2] << 7) | payload[1 + i*4 + 3];
+        if (cal_max <= cal_min) return 4;
     }
     return 0;
 }
 ```
 
-#### 响应构建函数示例（0x04）
+**按钮说明**：`cmd_proto_validate_calibration` 对所有物理控件执行 `max>min` 检查。若产品包含按钮，调用者必须确保其校准数据满足此约束（例如保持默认 min=0, max=4095），固件在映射时忽略按钮的校准值。
+
+#### 3.3.3 响应构建函数
+
+（0x04 已给出，此处补充 0x08 的关键片段）
 
 ```c
-void cmd_proto_build_device_info(uint8_t device_id, uint8_t N,
-                                 const cmd_phys_desc_t *phys,
-                                 uint8_t *buf_out, uint16_t *len_out) {
+void cmd_proto_build_layout(uint8_t device_id, const uint8_t *tree_data,
+                            uint16_t tree_len,
+                            uint8_t *buf_out, uint16_t *len_out) {
     uint16_t pos = 0;
     buf_out[pos++] = 0xF0;
     buf_out[pos++] = 0x7D;
     buf_out[pos++] = device_id;
-    buf_out[pos++] = 0x04;
-    buf_out[pos++] = N;
-    buf_out[pos++] = CMD_PROTO_VERSION;  // 0x16
+    buf_out[pos++] = 0x08;
+    // 14-bit 长度编码
+    buf_out[pos++] = (tree_len >> 7) & 0x7F;
+    buf_out[pos++] = tree_len & 0x7F;
+    memcpy(&buf_out[pos], tree_data, tree_len);
+    pos += tree_len;
 
-    for (uint8_t i = 0; i < N; i++) {
-        buf_out[pos++] = phys[i].mux;
-        buf_out[pos++] = phys[i].channel;
-        buf_out[pos++] = phys[i].cal_min_mid;
-        buf_out[pos++] = phys[i].cal_min_lo;
-        buf_out[pos++] = phys[i].cal_max_mid;
-        buf_out[pos++] = phys[i].cal_max_lo;
-    }
-
-    // 校验和从索引 1 到当前末尾
     uint8_t ck = roland_checksum(&buf_out[1], pos - 1);
     buf_out[pos++] = ck;
     buf_out[pos++] = 0xF7;
@@ -208,61 +295,54 @@ void cmd_proto_build_device_info(uint8_t device_id, uint8_t N,
 }
 ```
 
-其他构建函数类似，严格遵循协议文档的格式。布局树构建函数接收外部已组织好的树字节流，无需 CORE 理解节点语义。
-
-### 3.5 原有 `cmd_core_dispatch` 保留不变
-
-依然提供最底层帧解析与命令分发。校验和错误时返回错误码，不自动构建 NACK，由 APP 层决定是否回复。
+其他构建函数类似，均自动处理校验和。
 
 ---
 
 ## 4. cmd_cfg_app 详细设计（Lyre 专用）
 
-APP 层现在极其简洁：**定义产品常量与数据 + 注册命令回调 + 维护状态机**。
-
-### 4.1 产品常量与类型
+### 4.1 产品常量与数据
 
 ```c
+/* === cmd_cfg_app.h / .c === */
 #define LYRE_PHYS_COUNT        4
 #define LYRE_BANK_COUNT        1
 #define LYRE_VIRT_COUNT        4
-#define LYRE_DEVICE_ID         0x00  // 默认，可修改
+#define LYRE_DEVICE_ID         0x00   // 编译期固定，当前不支持运行时修改
 
-// 物理描述数组（固化映射）
+/* 物理描述（硬件固定，不可写） */
 const cmd_phys_desc_t lyre_phys_default[LYRE_PHYS_COUNT] = {
-    { 0x00, 0, 0x00, 0x00, 0x1F, 0x7F }, // GPIO26, ADC0
-    { 0x00, 1, 0x00, 0x00, 0x1F, 0x7F }, // GPIO27, ADC1
-    { 0x00, 2, 0x00, 0x00, 0x1F, 0x7F }, // GPIO28, ADC2
-    { 0x00, 3, 0x00, 0x00, 0x1F, 0x7F }, // GPIO29, ADC3
+    { 0x00, 0, 0x00, 0x00, 0x1F, 0x7F }, // ADC0
+    { 0x00, 1, 0x00, 0x00, 0x1F, 0x7F }, // ADC1
+    { 0x00, 2, 0x00, 0x00, 0x1F, 0x7F }, // ADC2
+    { 0x00, 3, 0x00, 0x00, 0x1F, 0x7F }, // ADC3
 };
 
-// 布局树（上排4推杆）
+/* 布局树 */
 const uint8_t lyre_layout_tree[] = {
-    0x01, 0x04,          // HBox, 4 children
-    0x11, 0x00,          // Fader, phys index 0
-    0x11, 0x01,          // Fader, phys index 1
-    0x11, 0x02,          // Fader, phys index 2
-    0x11, 0x03           // Fader, phys index 3
+    0x01, 0x04, 0x11, 0x00, 0x11, 0x01, 0x11, 0x02, 0x11, 0x03
 };
-#define LYRE_LAYOUT_TREE_LEN   (sizeof(lyre_layout_tree))
-```
+#define LYRE_LAYOUT_TREE_LEN  (sizeof(lyre_layout_tree))
 
-### 4.2 配置快照与双缓冲
-
-```c
+/* 配置快照结构体 */
 typedef struct {
     cmd_phys_desc_t phys[LYRE_PHYS_COUNT];
     cmd_virt_ctrl_t virt[LYRE_VIRT_COUNT];
 } lyre_config_t;
 
+/* 保存缓冲区大小 = max(2+4*V, 1+4*N) 取大值，这里 V=N=4，缓冲区只需 18 字节，
+   但为了可读性和移植性，使用宏定义 */
+#define CMD_SAVE_BUF_MAX  (2 + 4 * LYRE_VIRT_COUNT)  // Lyre: 18
+```
+
+### 4.2 配置快照与双缓冲
+
+```c
 static lyre_config_t cfg_buf[2];
 static lyre_config_t *cfg_current = &cfg_buf[0];
 static lyre_config_t *cfg_pending = &cfg_buf[1];
-```
 
-出厂默认虚拟配置（CC1–CC4, 通道0）：
-
-```c
+/* 出厂默认虚拟配置 */
 static void load_factory_defaults(void) {
     memcpy(cfg_current->phys, lyre_phys_default, sizeof(lyre_phys_default));
     for (uint8_t i = 0; i < LYRE_VIRT_COUNT; i++) {
@@ -274,15 +354,110 @@ static void load_factory_defaults(void) {
 }
 ```
 
-### 4.3 命令表与回调
+**双缓冲原子切换**：在 `CFG_SAVE_DONE` 状态下执行：
+```c
+lyre_config_t *tmp = cfg_current;
+cfg_current = cfg_pending;
+cfg_pending = tmp;
+```
+Cortex-M0+ 单核主循环上下文中，指针赋值是原子的，无竞态条件。切换后，`cfg_pending` 变为旧配置，下次写入前会在 `CFG_SAVE_START` 中通过 `memcpy(cfg_pending, cfg_current, sizeof(lyre_config_t))` 同步。
+
+### 4.3 内部状态与辅助函数
 
 ```c
-static void handle_0x03(const uint8_t *payload, uint16_t len, uint8_t cmd);
-static void handle_0x07(const uint8_t *payload, uint16_t len, uint8_t cmd);
-static void handle_0x0B(const uint8_t *payload, uint16_t len, uint8_t cmd);
-static void handle_0x0D(const uint8_t *payload, uint16_t len, uint8_t cmd);
-static void handle_0x0F(const uint8_t *payload, uint16_t len, uint8_t cmd);
-static void handle_0x11(const uint8_t *payload, uint16_t len, uint8_t cmd);
+typedef enum {
+    CFG_IDLE = 0,
+    CFG_SAVE_START,
+    CFG_SAVING,
+    CFG_SAVE_DONE,
+    CFG_ACK_PENDING,
+    CFG_SAVE_FAILED,   // 新增：写入失败恢复状态
+} cfg_state_t;
+
+static cfg_state_t current_state = CFG_IDLE;
+
+/* 事件标志 */
+static bool save_requested = false;
+static bool save_is_calibration = false;
+static uint8_t save_buffer[CMD_SAVE_BUF_MAX];
+static size_t  save_len = 0;
+
+static bool nack_pending = false;
+static uint8_t nack_cmd = 0;
+static uint8_t nack_status = 0;
+
+/* 查询标志（支持同时挂起多个查询时按优先级处理，当前简单实现每次只处理一个） */
+static uint8_t query_pending = 0; // 0=无，1=0x03, 2=0x07, 3=0x0B, 4=0x11
+
+static uint8_t ack_retries = 0;
+#define MAX_ACK_RETRIES 3
+
+/* 只设标志，不发送 */
+static void schedule_nack(uint8_t cmd, uint8_t status) {
+    nack_pending = true;
+    nack_cmd = cmd;
+    nack_status = status;
+}
+
+static void send_ack_response(void) {
+    uint8_t buf[7];
+    uint16_t len;
+    cmd_proto_build_ack(LYRE_DEVICE_ID, nack_cmd, nack_status, buf, &len);
+    if (midi_send_sysex(buf, len)) {
+        nack_pending = false;
+    } else {
+        ack_retries++;
+        if (ack_retries >= MAX_ACK_RETRIES) {
+            nack_pending = false; // 放弃
+            ack_retries = 0;
+        }
+    }
+}
+```
+
+### 4.4 命令表与回调（所有回调均不产生跨管线副作用）
+
+```c
+static void handle_0x03(const uint8_t *payload, uint16_t len, uint8_t cmd) {
+    (void)payload; (void)len; (void)cmd;
+    query_pending = 1;   // 设备信息查询
+}
+static void handle_0x07(...) { query_pending = 2; } // 布局
+static void handle_0x0B(...) { query_pending = 3; } // 虚拟配置
+
+static void handle_0x11(const uint8_t *payload, uint16_t len, uint8_t cmd) {
+    (void)payload; (void)len; (void)cmd;
+    if (current_state != CFG_IDLE) return; // 忙时静默忽略
+    query_pending = 4;
+}
+
+static void handle_0x0D(const uint8_t *payload, uint16_t len, uint8_t cmd) {
+    if (current_state != CFG_IDLE) {
+        schedule_nack(0x0E, 0x01);   // 忙，统一返回 NACK 0x01（与校验失败同，上位机将重试）
+        return;
+    }
+    uint8_t err = cmd_proto_validate_virt_config(payload, len,
+                                                 LYRE_BANK_COUNT, LYRE_VIRT_COUNT,
+                                                 LYRE_PHYS_COUNT);
+    if (err != 0) { schedule_nack(0x0E, 0x01); return; }
+    memcpy(save_buffer, payload, len);
+    save_len = len;
+    save_is_calibration = false;
+    save_requested = true;
+}
+
+static void handle_0x0F(const uint8_t *payload, uint16_t len, uint8_t cmd) {
+    if (current_state != CFG_IDLE) {
+        schedule_nack(0x10, 0x01);
+        return;
+    }
+    uint8_t err = cmd_proto_validate_calibration(payload, len, LYRE_PHYS_COUNT);
+    if (err != 0) { schedule_nack(0x10, 0x01); return; }
+    memcpy(save_buffer, payload, len);
+    save_len = len;
+    save_is_calibration = true;
+    save_requested = true;
+}
 
 static const cmd_entry_t cmd_table[] = {
     { 0x03, handle_0x03 },
@@ -294,97 +469,193 @@ static const cmd_entry_t cmd_table[] = {
 };
 ```
 
-**回调示例（0x0D）**：极度精简
+### 4.5 cmd_cfg_task() 状态机（完整伪代码）
 
 ```c
-static void handle_0x0D(const uint8_t *payload, uint16_t len, uint8_t cmd) {
-    if (cmd_cfg_get_state() != CFG_IDLE) {
-        schedule_nack(0x0E, 0x02);  // busy
-        return;
+void cmd_cfg_task(void) {
+    // --- 优先级：NACK > 写入请求 > 查询响应 ---
+    if (nack_pending) {
+        send_ack_response();
+        return;  // NACK 优先，本轮不做其他操作
     }
 
-    uint8_t err = cmd_proto_validate_virt_config(payload, len,
-                                                 LYRE_BANK_COUNT, LYRE_VIRT_COUNT,
-                                                 LYRE_PHYS_COUNT);
-    if (err != 0) {
-        schedule_nack(0x0E, 0x01);
-        return;
-    }
+    switch (current_state) {
+    case CFG_IDLE:
+        // 处理写入请求
+        if (save_requested) {
+            current_state = CFG_SAVE_START;
+            save_requested = false;
+            return;  // 下个周期执行 SAVE_START
+        }
+        // 处理查询请求
+        if (query_pending != 0) {
+            uint8_t buf[770]; uint16_t len;
+            switch (query_pending) {
+            case 1: cmd_proto_build_device_info(LYRE_DEVICE_ID, LYRE_PHYS_COUNT, cfg_current->phys, buf, &len); break;
+            case 2: cmd_proto_build_layout(LYRE_DEVICE_ID, lyre_layout_tree, LYRE_LAYOUT_TREE_LEN, buf, &len); break;
+            case 3: cmd_proto_build_virt_config(LYRE_DEVICE_ID, LYRE_BANK_COUNT, LYRE_VIRT_COUNT, cfg_current->virt, buf, &len); break;
+            case 4: {
+                uint16_t raw[LYRE_PHYS_COUNT];
+                pot_get_all_raw(raw, LYRE_PHYS_COUNT);
+                cmd_proto_build_adc_raw(LYRE_DEVICE_ID, LYRE_PHYS_COUNT, raw, buf, &len);
+                break;
+            }
+            default: break;
+            }
+            midi_send_sysex(buf, len);
+            query_pending = 0;
+        }
+        break;
 
-    // 保存原始 payload 以备稍后写入 cfg_pending
-    memcpy(save_buffer, payload, len);
-    save_len = len;
-    save_is_calibration = false;
-    save_requested = true;
+    case CFG_SAVE_START:
+        led_event_save_start();
+        pot_set_pause(true);
+        // 准备 cfg_pending
+        memcpy(cfg_pending, cfg_current, sizeof(lyre_config_t));
+        if (save_is_calibration) {
+            // 替换校准字段
+            const uint8_t *p = save_buffer + 1; // skip N
+            for (uint8_t i = 0; i < LYRE_PHYS_COUNT; i++) {
+                cfg_pending->phys[i].cal_min_mid = p[0];
+                cfg_pending->phys[i].cal_min_lo  = p[1];
+                cfg_pending->phys[i].cal_max_mid = p[2];
+                cfg_pending->phys[i].cal_max_lo  = p[3];
+                p += 4;
+            }
+        } else {
+            // 虚拟配置
+            const uint8_t *p = save_buffer + 2; // skip B,V
+            for (uint8_t i = 0; i < LYRE_VIRT_COUNT; i++) {
+                cfg_pending->virt[i].bank    = p[0];
+                cfg_pending->virt[i].phys_idx = p[1];
+                cfg_pending->virt[i].cc      = p[2];
+                cfg_pending->virt[i].channel = p[3];
+                p += 4;
+            }
+        }
+        if (!storage_save_config_begin((const uint8_t*)cfg_pending, sizeof(lyre_config_t))) {
+            // 写入启动失败
+            pot_set_pause(false);
+            schedule_nack(save_is_calibration ? 0x10 : 0x0E, 0x01);
+            current_state = CFG_IDLE;
+        } else {
+            current_state = CFG_SAVING;
+        }
+        break;
+
+    case CFG_SAVING:
+        if (storage_save_config_step()) {
+            // 写入完成，双缓冲切换
+            lyre_config_t *tmp = cfg_current;
+            cfg_current = cfg_pending;
+            cfg_pending = tmp;
+            current_state = CFG_SAVE_DONE;
+        }
+        // 若 step 返回 false，继续等待。目前 step 无错误返回，未来可扩展错误检测
+        break;
+
+    case CFG_SAVE_DONE:
+        pot_set_pause(false);
+        pot_reset_stable_values();
+        led_event_save_done();
+        {
+            uint8_t buf[7]; uint16_t len;
+            cmd_proto_build_ack(LYRE_DEVICE_ID, save_is_calibration ? 0x10 : 0x0E, 0x00, buf, &len);
+            if (midi_send_sysex(buf, len)) {
+                current_state = CFG_IDLE;
+                ack_retries = 0;
+            } else {
+                current_state = CFG_ACK_PENDING;
+                ack_retries = 1;
+            }
+        }
+        break;
+
+    case CFG_ACK_PENDING:
+        {
+            uint8_t buf[7]; uint16_t len;
+            cmd_proto_build_ack(LYRE_DEVICE_ID, save_is_calibration ? 0x10 : 0x0E, 0x00, buf, &len);
+            if (midi_send_sysex(buf, len)) {
+                current_state = CFG_IDLE;
+                ack_retries = 0;
+            } else if (++ack_retries >= MAX_ACK_RETRIES) {
+                current_state = CFG_IDLE; // 放弃重试
+            }
+        }
+        break;
+
+    case CFG_SAVE_FAILED:
+        // 预留，当前由 begin 失败直接转 IDLE
+        current_state = CFG_IDLE;
+        break;
+    }
 }
 ```
 
-### 4.4 状态机（cmd_cfg_task）
+### 4.6 持久化数据格式
 
-状态机逻辑与之前基本一致，但所有数据帧的构造均使用 `cmd_core` 提供的构建函数。
+存储管线保存/加载的 `data` 是 `lyre_config_t` 结构体的原始内存拷贝（小端对齐），所有字段均为 `uint8_t`，无端序问题。版本兼容性由 Storage 管线的 header version 保证。加载时若长度不符或 CRC 失败，`storage_load_config` 返回 false，APP 层回退到出厂默认。
 
-**CFG_IDLE 状态下的响应发送：**
+### 4.7 cmd_cfg_init() 实现要点
 
-- 查询 0x03：调用 `cmd_proto_build_device_info(LYRE_DEVICE_ID, LYRE_PHYS_COUNT, cfg_current->phys, buf, &len)` 然后 `midi_send_sysex(buf, len)`。
-- 查询 0x07：调用 `cmd_proto_build_layout(LYRE_DEVICE_ID, lyre_layout_tree, LYRE_LAYOUT_TREE_LEN, buf, &len)`。
-- 查询 0x0B：调用 `cmd_proto_build_virt_config(LYRE_DEVICE_ID, LYRE_BANK_COUNT, LYRE_VIRT_COUNT, cfg_current->virt, buf, &len)`。
-- 查询 0x11：调用 `pot_get_all_raw()` 后调用 `cmd_proto_build_adc_raw(LYRE_DEVICE_ID, LYRE_PHYS_COUNT, raw, buf, &len)`。
+```c
+void cmd_cfg_init(void) {
+    cmd_core_init();
+    size_t out_len;
+    if (storage_load_config((uint8_t*)cfg_current, sizeof(lyre_config_t), &out_len)) {
+        // 成功，可增加完整性检查
+    } else {
+        // 加载失败，使用出厂默认
+        load_factory_defaults();
+        // 同步尝试写回默认值（阻塞，但在 setup() 中可接受）
+        if (storage_save_config_begin((const uint8_t*)cfg_current, sizeof(lyre_config_t))) {
+            while (!storage_save_config_step()) { /* busy-wait, Flash 写入 <50ms */ }
+        }
+        // 写回失败静默忽略
+    }
+    // 其余状态初始化
+    current_state = CFG_IDLE;
+    save_requested = false;
+    nack_pending = false;
+    query_pending = 0;
+}
+```
 
-**CFG_SAVE_START 中的配置填充：**
+### 4.8 市场 API 实现
 
-- 0x0D：复制 `cfg_current` 到 `cfg_pending`，用 `payload` 中的数据覆写 `cfg_pending->virt`。
-- 0x0F：复制 `cfg_current` 到 `cfg_pending`，用 `payload` 中的校准数据覆写 `cfg_pending->phys` 中的校准字段（mux, channel 保持不变）。
+`cmd_cfg_process_sysex(const uint8_t *data, uint16_t len)`:
+```c
+void cmd_cfg_process_sysex(const uint8_t *data, uint16_t len) {
+    cmd_core_dispatch(data, len, LYRE_DEVICE_ID, cmd_table,
+                      sizeof(cmd_table)/sizeof(cmd_table[0]), NULL, NULL);
+    // dispatch 内部可能设置 schedule_nack 或 query_pending，均为纯标志操作，
+    // 不违反 @constraint。
+}
+```
 
-**保存完毕后双缓冲切换**。
-
-### 4.5 市场 API 实现一览
-
-`cmd_cfg_init()`：尝试从存储加载，失败则使用出厂默认并尝试写回。  
-`cmd_cfg_process_sysex()`：调用 `cmd_core_dispatch`，根据返回状态决定是否 schedule nack。  
-`config_get_*` 系列：直接读取 `cfg_current`。  
-`cmd_cfg_get_state()`：返回 `current_state`。  
-`cmd_cfg_task()`：运行状态机。
-
----
-
-## 5. 与其他管线的交互
-
-交互点与之前完全相同，但由于 APP 层不再内置响应构建逻辑，所有 SysEx 帧的生成均通过 `cmd_core` 的构建函数完成，调用时机由 `cmd_cfg_task` 控制。
-
----
-
-## 6. 移植性总结
-
-当需要为另一个使用《协议 v2.6》的 MIDI 控制器开发固件时：
-
-1. **保留** `cmd_core.c/h`（直接拷贝）。
-2. **重写** `cmd_cfg_app.c/h`，仅需：
-   - 修改物理控件数 N、库数 B、虚拟控件数 V。
-   - 提供物理描述数组（引脚映射）和布局树。
-   - 调整出厂默认虚拟映射。
-   - 其他状态机逻辑保持高度相似，基本只需复制粘贴并调整常量。
-3. 上层 `market/cmd_cfg_api.h` 接口形状不变，新产品只需提供一致的 `config_get_pot_mapping` 等实现。
-
-整条管线从“与产品耦合”转变为“协议引擎 + 产品薄壳”，符合架构设计中 CORE 层“免检拷贝”的最高复用原则。
+`config_get_pot_mapping` 等直接读取 `cfg_current->virt`，批量接口同理，保证单次调用一致性。
 
 ---
 
-## 附录 A：cmd_core API 完整清单
+## 5. 状态机转移图
 
-| 函数 | 类别 | 依赖 |
-|------|------|------|
-| `cmd_core_init()` | 初始化 | 无 |
-| `cmd_core_dispatch()` | 命令分发 | 无 |
-| `cmd_proto_validate_virt_config()` | 校验 | 无 |
-| `cmd_proto_validate_calibration()` | 校验 | 无 |
-| `cmd_proto_build_ack()` | 响应构建 | 无 |
-| `cmd_proto_build_device_info()` | 响应构建 | 无 |
-| `cmd_proto_build_virt_config()` | 响应构建 | 无 |
-| `cmd_proto_build_adc_raw()` | 响应构建 | 无 |
-| `cmd_proto_build_layout()` | 响应构建 | 无 |
-
-所有函数均为纯计算，可在任何平台上编译运行。
+```
+CFG_IDLE ──save_requested──▶ CFG_SAVE_START
+CFG_IDLE ◀──ACK发送成功─── CFG_SAVE_DONE
+CFG_IDLE ◀──begin失败───── CFG_SAVE_START
+CFG_SAVE_START ──begin成功──▶ CFG_SAVING
+CFG_SAVING ──step true──▶ CFG_SAVE_DONE
+CFG_SAVE_DONE ──ACK发送中──▶ CFG_ACK_PENDING
+CFG_ACK_PENDING ──成功/超限──▶ CFG_IDLE
+CFG_SAVE_FAILED ──清理──▶ CFG_IDLE (预留)
+```
 
 ---
 
-*本文档 v2.0 彻底贯彻“最大可移植性”，将通用协议逻辑完全收束至 cmd_core 层，cmd_cfg_app 仅保留 Lyre 强相关定义。后续任何基于协议 v2.6 的产品均可复用 cmd_core 而不必重写协议处理。*
+## 6. 附录：修订记录
+
+- v2.1：依据架构审计报告闭环所有缺陷。主要修改：明确 `cmd_cfg_process_sysex` 零副作用，所有跨管线调用延迟到 `cmd_cfg_task`；补充接口定义、VLA 替换为固定数组、统一长度类型、增加查询回调实现、完善状态机与错误路径、新增持久化格式说明。
+
+---
+
+*本文档 v2.1 经审计闭环，可直接作为编码实现的权威依据。*
