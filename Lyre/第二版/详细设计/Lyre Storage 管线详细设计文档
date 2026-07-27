@@ -1,12 +1,12 @@
-# Lyre Storage 管线详细设计文档 v1.2
+# Lyre Storage 管线详细设计文档 v1.3
 
 | 项目 | 说明 |
 |------|------|
-| 文档版本 | v1.2 |
+| 文档版本 | v1.3 |
 | 对应管线 | Storage（`pipelines/storage/`） |
 | 上游依据 | 《Lyre MK2 产品架构设计文档 v2.2》（终审冻结版） |
 | 遵循规范 | 《信息管线星型架构 v1.1》 |
-| 变更说明 | 基于 v1.1 审计报告修复 9 项发现（P1×2 / P2×4 / P3×3） |
+| 变更说明 | 基于 v1.2 审计报告修复 6 项发现（P2×3 / P3×3） |
 | 最后更新 | 2026-07-27 |
 
 ---
@@ -17,7 +17,8 @@
 |------|------|----------|
 | v1.0 | 2026-07-25 | 初版 |
 | v1.1 | 2026-07-27 | 修复 v1.0 审计 12 项发现 |
-| v1.2 | 2026-07-27 | 修复 v1.1 审计 9 项发现：N-01 强化 step() 语义文档；N-02 删除多余 lfs_remove 消除断电窗口；N-03 补充缓冲区复用场景分析；N-04 明确非活跃状态防御行为；N-05 补充 CORE 层前置条件注释；N-06 修正 CRC 表末尾值；N-07 HAL 层增加参数校验；N-08 修正时序估算；N-09 修正"预留"措辞 |
+| v1.2 | 2026-07-27 | 修复 v1.1 审计 9 项发现 |
+| v1.3 | 2026-07-27 | 修复 v1.2 审计 6 项发现：N-10 调整 begin() 步骤顺序；N-11 补充回读验证局限性说明；N-12 补充 close 失败清理说明；N-13 统一时序轮次划分；N-14 补充 CRC 空输入行为注释；N-16 统一 finalize 接口注释 |
 
 ---
 
@@ -257,8 +258,10 @@ bool storage_hal_write_step(const uint8_t *data, size_t len);
 
 /**
  * 完成写入会话：关闭临时文件，原子替换正式文件。
- * 内部执行：lfs_file_close → lfs_rename("/cfg.tmp", "/cfg.bin")
+ * 内部执行：lfs_file_close → lfs_rename("/cfg.tmp", "/cfg.bin")。
  * lfs_rename 遵循 POSIX 语义：若 /cfg.bin 已存在则原子覆盖。
+ * 若 lfs_file_close 失败，内部会尝试删除临时文件进行清理，
+ * 残留文件由下次 storage_hal_init() 兜底清理。
  * @return true 成功；false 关闭或替换失败
  */
 bool storage_hal_write_finalize(void);
@@ -431,7 +434,13 @@ bool storage_hal_write_finalize(void)
     /* 关闭临时文件，确保数据落盘 */
     int err = lfs_file_close(&g_lfs, &g_write_file);
     g_write_file_open = false;
+
     if (err != LFS_ERR_OK) {
+        /*
+         * close 失败：文件句柄可能处于不一致状态，不再尝试二次 close。
+         * 尝试删除临时文件进行清理。若 remove 也失败（LittleFS 内部
+         * 仍持有引用），残留文件由下次 storage_hal_init() 兜底清理。
+         */
         lfs_remove(&g_lfs, STORAGE_TMP_PATH);
         return false;
     }
@@ -545,8 +554,10 @@ _Static_assert(sizeof(storage_header_t) == STORAGE_HDR_SIZE,
 /**
  * 计算 CRC-32（ISO-HDLC / zlib 兼容）。
  * 使用编译期常量查找表，无运行时初始化开销。
- * @param data  输入数据（len > 0 时不可为 NULL）
- * @param len   数据长度
+ *
+ * @param data  输入数据。len > 0 时不可为 NULL。
+ *              len == 0 时 data 可为 NULL（不会被解引用）。
+ * @param len   数据长度。len == 0 时返回 0x00000000。
  * @return CRC-32 校验值
  */
 uint32_t storage_crc32(const uint8_t *data, size_t len);
@@ -570,7 +581,8 @@ void storage_header_deserialize(const uint8_t *in, storage_header_t *hdr);
 /**
  * 构建完整的 Header。
  * 自动填充 magic、version、payload_len、crc32，reserved 置零。
- * @param payload      Payload 数据指针
+ * 当 payload_len == 0 时，crc32 字段为 0x00000000。
+ * @param payload      Payload 数据指针（payload_len > 0 时不可为 NULL）
  * @param payload_len  Payload 长度
  * @param hdr          输出 Header 结构体
  */
@@ -643,6 +655,7 @@ uint32_t storage_crc32(const uint8_t *data, size_t len)
 **设计决策说明**：
 - 查找表占用 1KB Flash（`static const` 存储在 Flash 中，不占 RAM）。
 - 无运行时初始化，首次调用与后续调用性能一致。
+- `len == 0` 时循环不执行，返回 `0xFFFFFFFF ^ 0xFFFFFFFF = 0x00000000`，`data` 不被解引用，可为 NULL。
 - 若需进一步节省 Flash，可改为逐位计算（无表），速度降低约 8 倍，但对本项目 < 512 字节的 payload 无实质影响。
 
 ### 5.4 Header 编解码实现
@@ -858,26 +871,31 @@ bool storage_save_config_begin(const uint8_t *data, size_t len)
         return false;  /* 不允许重入 */
     }
 
-    /* 1. 构建 Header */
-    storage_header_t hdr;
-    storage_header_build(data, (uint16_t)len, &hdr);
-
-    /* 2. 序列化 Header 到帧缓冲区 */
-    storage_header_serialize(&hdr, s_frame_buf);
-
-    /* 3. 拷贝 Payload 到帧缓冲区 */
-    memcpy(&s_frame_buf[STORAGE_HDR_SIZE], data, len);
-
-    /* 4. 初始化写入进度 */
-    s_write_total_len = STORAGE_HDR_SIZE + len;
-    s_write_offset = 0;
-
-    /* 5. 打开 HAL 写入会话 */
+    /*
+     * 步骤 1：先打开 HAL 写入会话。
+     * 将 HAL 操作放在帧构建之前，确保 HAL 打开失败时
+     * 不修改任何内部状态（帧缓冲区、进度变量），
+     * 遵循"失败时不修改任何状态"的防御性原则。
+     */
     if (!storage_hal_write_begin()) {
         return false;
     }
 
-    /* 6. 切换状态 */
+    /* 步骤 2：构建 Header */
+    storage_header_t hdr;
+    storage_header_build(data, (uint16_t)len, &hdr);
+
+    /* 步骤 3：序列化 Header 到帧缓冲区 */
+    storage_header_serialize(&hdr, s_frame_buf);
+
+    /* 步骤 4：拷贝 Payload 到帧缓冲区 */
+    memcpy(&s_frame_buf[STORAGE_HDR_SIZE], data, len);
+
+    /* 步骤 5：初始化写入进度 */
+    s_write_total_len = STORAGE_HDR_SIZE + len;
+    s_write_offset = 0;
+
+    /* 步骤 6：切换状态 */
     s_write_state = WRITE_ACTIVE;
     return true;
 }
@@ -886,6 +904,7 @@ bool storage_save_config_begin(const uint8_t *data, size_t len)
 **设计说明**：
 - `data` 指针的内容在 `begin()` 中被**完整拷贝**到 `s_frame_buf`，调用者在 `begin()` 返回后可立即释放或修改原始缓冲区。
 - 帧缓冲区为静态分配，生命周期覆盖整个写入会话，无需动态内存管理。
+- HAL 打开操作在帧构建之前执行。若 HAL 打开失败，`s_frame_buf`、`s_write_offset`、`s_write_total_len` 均未被修改，`s_write_state` 保持原值（IDLE / DONE / FAILED），后续 `begin()` 可正常重试。
 
 #### 6.5.2 `storage_save_config_step()`
 
@@ -1086,8 +1105,10 @@ bool storage_erase_config(void)
 | Flash 硬件不可用 | `ensure_initialized()` | `s_hal_ready = false`，所有后续操作返回 `false` | 所有 API 返回 `false` |
 | LittleFS 挂载失败 | `storage_hal_init()` | 自动格式化后重试；仍失败则标记不可用 | 同上 |
 | Payload 参数非法 | `storage_save_config_begin()` | 立即返回 `false`，不修改任何状态 | `begin()` 返回 `false` |
+| HAL 打开临时文件失败 | `storage_save_config_begin()` | 立即返回 `false`，不修改任何状态（HAL 操作在帧构建之前） | `begin()` 返回 `false` |
 | 写入过程中 Flash I/O 错误 | `storage_save_config_step()` | 自动 `cancel()` 清理临时文件，状态 → `WRITE_FAILED` | `step()` 返回 `true`（会话结束） |
-| finalize 失败（rename 错误） | `storage_save_config_step()` | 状态 → `WRITE_FAILED`，临时文件残留（下次 init 清理） | `step()` 返回 `true`（会话结束） |
+| finalize 失败 — close 错误 | `storage_save_config_step()` | 尝试删除临时文件（可能也失败），状态 → `WRITE_FAILED`，残留文件由下次 init 清理 | `step()` 返回 `true`（会话结束） |
+| finalize 失败 — rename 错误 | `storage_save_config_step()` | 状态 → `WRITE_FAILED`，临时文件残留（下次 init 清理） | `step()` 返回 `true`（会话结束） |
 | 非活跃状态调用 step() | `storage_save_config_step()` | 触发 debug assert，返回 `true` | 调用者回读验证将反映 Flash 实际状态（防御性路径，正常流程不应到达） |
 | 读取时文件不存在 | `storage_load_config()` | 返回 `false` | 调用者回退出厂默认 |
 | 读取时 CRC 校验失败 | `storage_load_config()` | 返回 `false` | 同上 |
@@ -1124,6 +1145,20 @@ Storage 管线本身**不主动通知**调用者写入失败（符合被动服�
 - 验证的是端到端数据完整性，比检查内部标志更可靠。
 - 额外开销 ~1ms，在 10ms 主循环周期内可接受。
 
+**已知局限性**：
+
+回读验证确认的是"Flash 中存在**某个**有效配置"，而非"Flash 中存在**本次写入的**配置"。在以下极端场景中可能给出假阳性：
+
+> 写入会话在 `WRITE_ACTIVE` 阶段因 Flash I/O 错误失败 → `step()` 返回 `true` → 调用者回读验证 → Flash 中仍存在上一次成功写入的旧配置 → `storage_load_config()` 返回 `true` → 调用者误判为本次写入成功。
+
+**风险评估**：
+- 发生条件：Flash I/O 错误恰好发生在写入过程中，且旧配置仍完好。
+- 发生概率：极低。RP2040 板载 SPI Flash 的写入错误率远低于 10⁻⁶/次。
+- 后果：RAM 快照与 Flash 内容不一致（RAM 为新配置，Flash 为旧配置）。下次上电将加载旧配置，用户需重新配置。不会导致数据损坏或系统不可用。
+- 缓解：若需更严格的验证，调用者可在回读后与原始写入数据进行 `memcmp` 比较。此逻辑在 `cmd_cfg_task` 内部完成，不需要修改 Storage 管线的市场 API。
+
+**结论**：此局限性在当前使用场景中可接受，不构成设计缺陷。
+
 ---
 
 ## 8. 时序分析
@@ -1132,7 +1167,19 @@ Storage 管线本身**不主动通知**调用者写入失败（符合被动服�
 
 以下时序分析基于**主循环周期 10ms** 的假设。主循环周期由 `cmd_cfg_task()` 的调用频率决定，受 USB 轮询和 Pot 扫描节奏影响，典型值为 10ms。
 
-### 8.2 分步写入时序（典型场景：28 字节 Payload）
+### 8.2 `cmd_cfg_task()` 写入状态机轮次划分
+
+为统一时序分析基准，明确 `cmd_cfg_task()` 中配置写入相关的状态机轮次划分：
+
+| 状态 | 每轮次执行的操作 | 说明 |
+|------|-----------------|------|
+| `CFG_SAVE_START` | `led_event_save_start()` + `pot_set_pause(true)` + `storage_save_config_begin()` → 进入 `CFG_SAVING` | 1 个轮次 |
+| `CFG_SAVING` | `storage_save_config_step()` → 若返回 `false` 则停留；若返回 `true` 则执行回读验证 + 结果处理 → 进入 `CFG_SAVE_DONE` | 每步 1 个轮次 |
+| `CFG_SAVE_DONE` | `pot_set_pause(false)` + `led_event_save_done()` + `midi_send_sysex(ACK/NACK)` → 进入 `CFG_IDLE` | 1 个轮次 |
+
+**关键约定**：回读验证在 `CFG_SAVING` 状态的最后一轮（`step()` 返回 `true` 时）执行，与结果判定（ACK/NACK 决策）在同一轮次完成。`pot_set_pause(false)` 和 LED/ACK 发送在下一个轮次（`CFG_SAVE_DONE`）执行。
+
+### 8.3 分步写入时序（典型场景：28 字节 Payload）
 
 ```
 帧总长度 = 16 (Header) + 28 (Payload) = 44 bytes
@@ -1140,19 +1187,19 @@ Storage 管线本身**不主动通知**调用者写入失败（符合被动服�
 数据写入步数 = ceil(44 / 256) = 1 步
 总步数 = 1 (数据) + 1 (finalize) = 2 步
 
-主循环轮次    动作                          耗时估算
-─────────────────────────────────────────────────────
+主循环轮次    状态           动作                          耗时估算
+─────────────────────────────────────────────────────────────────────
 Tick N       CFG_SAVE_START:
              led_event_save_start()         < 0.1ms
              pot_set_pause(true)            < 0.01ms
-             storage_save_config_begin()    < 0.1ms (memcpy + CRC + lfs_file_open)
-             → 进入 CFG_SAVING
+             storage_save_config_begin()    < 0.1ms
              [Pot 暂停开始]
+             → 进入 CFG_SAVING
 
 Tick N+1     CFG_SAVING:
              storage_save_config_step()
                └─ WRITE_ACTIVE:
-                  storage_hal_write_step(44B)  ~0.5ms (lfs_file_write)
+                  storage_hal_write_step(44B)  ~0.5ms
                   → 数据写完，进入 WRITE_FINALIZING
              返回 false（还有 finalize 一步）
 
@@ -1161,10 +1208,10 @@ Tick N+2     CFG_SAVING:
                └─ WRITE_FINALIZING:
                   storage_hal_write_finalize()
                     ├─ lfs_file_close       ~0.5ms
-                    └─ lfs_rename           ~0.5ms（最坏 ~45ms，见 §8.3）
+                    └─ lfs_rename           ~0.5ms（最坏 ~45ms，见 §8.4）
              返回 true（会话结束）
              回读验证 storage_load_config()  ~1ms
-             pot_reset_stable_values()       < 0.01ms
+             结果判定（ACK/NACK 决策）       < 0.01ms
              → 进入 CFG_SAVE_DONE
 
 Tick N+3     CFG_SAVE_DONE:
@@ -1179,7 +1226,7 @@ Pot 暂停跨越 Tick N ~ Tick N+3，共 4 个主循环轮次。
 最坏 Pot 暂停时间：10 + 10 + 55 + 10 = ~85ms（finalize 触发 metadata 擦除）
 ```
 
-### 8.3 最坏情况分析：finalize 中的 metadata 擦除
+### 8.4 最坏情况分析：finalize 中的 metadata 擦除
 
 `lfs_rename()` 需要更新目录项元数据。LittleFS 的元数据以 Metadata Pair 形式存储，更新时需要：
 1. 将新元数据写入 pair 中的另一个 block（1 次 prog，~45μs）
@@ -1191,26 +1238,38 @@ Pot 暂停跨越 Tick N ~ Tick N+3，共 4 个主循环轮次。
 
 **结论**：当前设计在典型场景下满足 ADR-005 的 "<5ms" 约束。最坏场景为低概率事件，影响可控，无需额外缓解措施。
 
-### 8.4 最大 Payload 场景（512 字节）
+### 8.5 最大 Payload 场景（512 字节）
 
 ```
 帧总长度 = 16 + 512 = 528 bytes
 数据写入步数 = ceil(528 / 256) = 3 步
 总步数 = 3 (数据) + 1 (finalize) = 4 步
 
-Tick N       begin()                    [Pot 暂停开始]
-Tick N+1     step() → false (写入 256B)
-Tick N+2     step() → false (写入 256B)
-Tick N+3     step() → false (写入 16B, 进入 FINALIZING)
-Tick N+4     step() → true  (执行 finalize)
-Tick N+5     回读验证 + CFG_SAVE_DONE
-Tick N+6     pot_set_pause(false)       [Pot 暂停结束]
+主循环轮次    状态           动作
+─────────────────────────────────────────────────────────────────────
+Tick N       CFG_SAVE_START: begin()
+             [Pot 暂停开始]
+             → 进入 CFG_SAVING
 
-Pot 暂停跨越 Tick N ~ Tick N+6，共 7 个主循环轮次。
-典型 Pot 暂停时间：7 × 10ms = ~70ms
+Tick N+1     CFG_SAVING:     step() → false (写入 256B)
+Tick N+2     CFG_SAVING:     step() → false (写入 256B)
+Tick N+3     CFG_SAVING:     step() → false (写入 16B, 进入 FINALIZING)
+Tick N+4     CFG_SAVING:     step() → true  (执行 finalize)
+                             回读验证 + 结果判定
+             → 进入 CFG_SAVE_DONE
+
+Tick N+5     CFG_SAVE_DONE:
+             pot_set_pause(false)
+             [Pot 暂停结束]
+             led_event_save_done()
+             midi_send_sysex(ACK)
+             → 进入 CFG_IDLE
+
+Pot 暂停跨越 Tick N ~ Tick N+5，共 6 个主循环轮次。
+典型 Pot 暂停时间：6 × 10ms = ~60ms
 ```
 
-### 8.5 配置加载时序（上电）
+### 8.6 配置加载时序（上电）
 
 ```
 cmd_cfg_init():
@@ -1237,11 +1296,12 @@ CORE 层零外部依赖，可在 PC 上直接编译运行单元测试。
 | 测试项 | 验证内容 |
 |--------|----------|
 | CRC-32 正确性 | `storage_crc32("123456789", 9) == 0xCBF43926` |
-| CRC-32 空输入 | `storage_crc32(data, 0) == 0x00000000` |
+| CRC-32 空输入 | `storage_crc32(NULL, 0) == 0x00000000` |
 | CRC-32 单字节 | `storage_crc32("\x00", 1) == 0xD202EF8D` |
 | CRC-32 表首尾验证 | `s_crc_table[0] == 0x00000000`, `s_crc_table[255] == 0xB3667A2E` |
 | Header 序列化/反序列化往返 | `deserialize(serialize(hdr)) == hdr` |
 | Header 构建 | magic、version、payload_len、crc 字段正确 |
+| Header 构建 - 零长度 | `storage_header_build(NULL, 0, &hdr)` → `hdr.crc32 == 0x00000000`，不崩溃 |
 | Header 验证 - 正常 | 合法 Header + 正确 Payload → `true` |
 | Header 验证 - magic 错误 | 篡改 magic → `false` |
 | Header 验证 - version 错误 | 篡改 version → `false` |
@@ -1271,6 +1331,7 @@ HAL 层依赖 RP2040 硬件，需在目标板上测试。
 | Lazy Init | 首次 load 自动触发 HAL init |
 | begin → step × N → 完成 | 完整写入流程，回读验证 |
 | begin 参数校验 | NULL / 0 / 超限 → 返回 `false` |
+| begin HAL 失败不修改状态 | 模拟 HAL write_begin 失败 → 返回 `false`，`s_frame_buf` 和进度变量未被修改 |
 | 重入保护 | ACTIVE/FINALIZING 状态下再次 begin → 返回 `false` |
 | abort 后状态恢复 | abort → 再次 begin → 正常完成 |
 | step 失败处理 | 模拟 HAL write_step 失败 → step 返回 true → load 返回 false |
@@ -1349,9 +1410,9 @@ Storage 管线的 CORE 层（CRC-32、Header 编解码）为纯算法模块，�
 | §3 Storage 管线职责 | §1.1 |
 | §4.4 storage_api.h 接口（5 个函数） | §6.5 |
 | §5.3 三层结构 | §2 |
-| §6.2 业务流 2（配置写入） | §6.5.1–6.5.3, §8.2–8.4 |
+| §6.2 业务流 2（配置写入） | §6.5.1–6.5.3, §8.2–8.5 |
 | §6.2 失败处理（NACK） | §7.3 |
-| §6.4 业务流 4（启动加载） | §6.5.4, §6.4, §8.5 |
+| §6.4 业务流 4（启动加载） | §6.5.4, §6.4, §8.6 |
 | §6.4 加载失败后写入默认 | §1.4（职责边界声明） |
 | §7 并发与数据一致性 | §4.3.2（中断保护）, §4.3.4（原子替换） |
 | §9 依赖关系图 | §6.4（Lazy Init）, §11.1 |
@@ -1384,15 +1445,26 @@ Storage 管线的 CORE 层（CRC-32、Header 编解码）为纯算法模块，�
 
 | 编号 | 级别 | 问题摘要 | 处置 | 说明 |
 |------|------|----------|------|------|
-| N-01 | P1 | step() 返回 true 语义歧义残留 | ✅ 已修复 | 在 API 契约中增加 `@warning` 注释（§6.5.2）。未新增市场 API 函数（尊重冻结状态）。 |
-| N-02 | P1 | finalize 中 lfs_remove + lfs_rename 非原子窗口 | ✅ 已修复 | 删除多余的 `lfs_remove`，直接 `lfs_rename` 原子覆盖（§4.3.4）。修正 §7.2 断电分析表。 |
-| N-03 | P2 | s_frame_buf 复用未覆盖回读验证场景 | ✅ 已修复 | 在 §6.3 注释中补充"save 完成后立即 load"场景的安全性论证。 |
-| N-04 | P2 | 非活跃状态 step() 返回 true 语义不清 | ✅ 已修复 | 保持返回 true（终止调用者循环），增加 debug assert，在 §7.1 错误表中补充说明。 |
-| N-05 | P2 | storage_header_validate() 未校验上界 | ✅ 已修复 | 在函数注释中增加 `@note` 前置条件说明（§5.2）。不在 CORE 层添加产品特有上界检查（维护零产品假设原则）。 |
-| N-06 | P2 | CRC 表末尾值错误 | ✅ 已修复 | 修正末 8 项为标准值（§5.3）。增加表首尾验证测试项（§9.1）。 |
-| N-07 | P3 | HAL 层未检查 NULL 参数 | ✅ 已修复 | `read_file` 和 `write_step` 入口增加参数校验（§4.3.4, §4.3.5）。 |
-| N-08 | P3 | Pot 暂停时间估算错误 | ✅ 已修复 | 修正为 4 轮次 ~40ms（典型）/ ~85ms（最坏），明确 10ms 主循环假设（§8.1, §8.2）。 |
-| N-09 | P3 | "预留"措辞与实现矛盾 | ✅ 已修复 | 改为"已实现，待 cmd_cfg_app 集成调用"（§1.3）。 |
+| N-01 | P1 | step() 返回 true 语义歧义残留 | ✅ v1.2 修复 | 在 API 契约中增加 `@warning` 注释（§6.5.2） |
+| N-02 | P1 | finalize 中 lfs_remove + lfs_rename 非原子窗口 | ✅ v1.2 修复 | 删除多余的 `lfs_remove`，直接 `lfs_rename`（§4.3.4） |
+| N-03 | P2 | s_frame_buf 复用未覆盖回读验证场景 | ✅ v1.2 修复 | §6.3 注释补充场景分析 |
+| N-04 | P2 | 非活跃状态 step() 返回 true 语义不清 | ✅ v1.2 修复 | 增加 debug assert + §7.1 补充说明 |
+| N-05 | P2 | storage_header_validate() 未校验上界 | ✅ v1.2 修复 | 函数注释增加 `@note` 前置条件 |
+| N-06 | P2 | CRC 表末尾值错误 | ✅ v1.2 修复 | 修正末 8 项 + 增加验证测试 |
+| N-07 | P3 | HAL 层未检查 NULL 参数 | ✅ v1.2 修复 | 入口增加参数校验 |
+| N-08 | P3 | Pot 暂停时间估算错误 | ✅ v1.2 修复 | 修正轮次计算 + 明确 10ms 假设 |
+| N-09 | P3 | "预留"措辞与实现矛盾 | ✅ v1.2 修复 | 改为"已实现，待集成调用" |
+
+#### v1.2 审计（6 项）
+
+| 编号 | 级别 | 问题摘要 | 处置 | 说明 |
+|------|------|----------|------|------|
+| N-10 | P2 | `begin()` HAL 失败后内部状态不一致 | ✅ v1.3 修复 | 调整步骤顺序：先 HAL 打开，成功后再构建帧（§6.5.1） |
+| N-11 | P2 | 回读验证假阳性（无法区分本次写入与旧配置） | ✅ v1.3 修复 | 在 §7.3 补充已知局限性说明和风险评估 |
+| N-12 | P2 | `lfs_file_close` 失败后清理说明不完整 | ✅ v1.3 修复 | §4.3.4 增加注释 + §7.1 拆分为 close/rename 两种子场景 |
+| N-13 | P3 | §8.2 与 §8.4 轮次划分不一致 | ✅ v1.3 修复 | 新增 §8.2 统一状态机轮次划分基准，§8.5 修正为 6 轮次 |
+| N-14 | P3 | `storage_crc32()` 空输入行为未明确 | ✅ v1.3 修复 | 函数注释补充 `len == 0` 行为 + §9.1 增加零长度 Header 构建测试 |
+| N-16 | P3 | `storage_hal_write_finalize()` 注释与实现不一致 | ✅ v1.3 修复 | §4.2 注释补充 close 失败清理行为 |
 
 ### 11.5 关于审计建议的独立判断
 
@@ -1415,11 +1487,23 @@ Storage 管线的 CORE 层（CRC-32、Header 编解码）为纯算法模块，�
 | N-02：删除 `lfs_remove` | ✅ 采纳 | 一行代码修复，消除真实断电风险窗口。 |
 | N-04 方案 A：非活跃状态返回 false | ❌ 未采纳 | 可能导致调用者无限循环。 |
 | N-04 方案 B+C：保持 true + assert | ✅ 采纳 | 防御性最佳实践。 |
-| N-05：在 CORE 层增加上界检查 | ❌ 未采纳（过度设计） | `STORAGE_MAX_PAYLOAD_LEN` 是产品特有约束，放入 CORE 层违反 v1.1 确立的"零产品假设"原则。改为在函数注释中声明前置条件。 |
+| N-05：在 CORE 层增加上界检查 | ❌ 未采纳（过度设计） | `STORAGE_MAX_PAYLOAD_LEN` 是产品特有约束，放入 CORE 层违反"零产品假设"原则。改为在函数注释中声明前置条件。 |
 | N-06：修正 CRC 表值 | ✅ 采纳 | 文档准确性必须保证。 |
 | N-07：HAL 层增加 NULL 检查 | ✅ 采纳 | 低成本防御性编程。 |
 | N-08：修正时序估算 | ✅ 采纳 | 文档准确性。 |
 | N-09：修正"预留"措辞 | ✅ 采纳 | 消除歧义。 |
+
+#### v1.2 审计建议
+
+| 审计建议 | 采纳情况 | 理由 |
+|----------|----------|------|
+| N-10：调整 `begin()` 步骤顺序 | ✅ 采纳 | 一行代码改动，遵循"失败时不修改任何状态"原则。 |
+| N-11：补充回读验证局限性说明 | ✅ 采纳 | 文档透明性，帮助调用者理解风险边界。 |
+| N-11：回读后 `memcmp` 比较 | ❌ 未纳入 Storage 管线设计（过度设计） | 此逻辑属于 `cmd_cfg_task` 的可选增强，不属于 Storage 管线职责。在 §7.3 中作为"若需更严格验证"的建议提及即可。 |
+| N-12：补充 close 失败注释 | ✅ 采纳 | 文档完整性。 |
+| N-13：统一轮次划分 | ✅ 采纳 | 消除文档内部不一致。 |
+| N-14：补充 CRC 空输入注释 | ✅ 采纳 | 接口契约完整性。 |
+| N-16：统一 finalize 注释 | ✅ 采纳 | 文档一致性。 |
 
 ---
 
