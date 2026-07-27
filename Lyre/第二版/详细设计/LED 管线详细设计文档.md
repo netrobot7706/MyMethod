@@ -1,10 +1,10 @@
-# LED 管线详细设计文档 v1.1
+# LED 管线详细设计文档 v1.2
 
-**文档版本**：v1.1  
+**文档版本**：v1.2  
 **对应架构**：《Lyre MK2 产品架构设计文档 v2.2》§5.5  
 **管线目录**：`pipelines/led/`  
 **市场契约**：`market/led_api.h`（已冻结，本文档不修改其接口签名）  
-**变更说明**：基于 v1.0 审计报告闭环修订，修复 4 项严重缺陷、7 项中等缺陷，吸收 3 项改进建议，驳回 1 项过度设计建议。
+**变更说明**：基于 v1.1 审计报告闭环修订，修复 2 项中等缺陷，吸收 3 项低风险改进。
 
 ---
 
@@ -30,7 +30,7 @@
 │  · 亮度曲线参数                                                  │
 │  · 事件→动画参数映射表                                            │
 │  · 实现 led_api.h 中所有函数（极薄胶水，翻译产品语义→CORE 调用）    │
-│  · 首次 led_task() 调用时自动完成 HAL+CORE 初始化                 │
+│  · 任意公开 API 首次调用时自动完成 HAL+CORE 初始化                 │
 ├─────────────────────────────────────────────────────────────────┤
 │  led_core.c  （CORE 层，零外部依赖，可跨产品复用）                 │
 │  · 颜色模型与运算                                                │
@@ -305,6 +305,7 @@ typedef enum {
  *
  * @note output_cb 实现了 CORE→HAL 的依赖反转，CORE 不直接依赖 HAL。
  * @note 内部使用静态数组分配，无动态内存分配。
+ * @note 调用此函数会重置内部时钟（time_ms = 0）及所有层状态。
  */
 typedef void (*led_output_cb_t)(led_color_t color);
 bool led_core_init(uint8_t num_layers, led_output_cb_t output_cb);
@@ -369,7 +370,7 @@ static struct {
     led_layer_t     layers[LED_CORE_MAX_LAYERS];  // 静态分配，无 malloc
     uint8_t         num_layers;
     led_output_cb_t output_cb;
-    uint32_t        time_ms;        // 累计时间
+    uint32_t        time_ms;        // 累计时间（led_core_init 时重置为 0）
     uint8_t         gamma_buf[256]; // gamma 表内部拷贝缓冲区
     const uint8_t  *gamma_table;    // 指向 gamma_buf 或内置默认表
     bool            initialized;
@@ -389,7 +390,9 @@ brightness(t) = params.static_params.brightness
 #### 3.4.2 BLINK
 
 ```
-cycle_period = on_duration + off_duration
+// cycle_period 以 uint32_t 计算（C 语言整数提升保证 uint16_t + uint16_t → int/uint32_t）
+uint32_t cycle_period = (uint32_t)on_duration + (uint32_t)off_duration
+
 elapsed = t - start_time
 phase = elapsed % cycle_period
 
@@ -537,14 +540,85 @@ table[i] = round(255 × (i / 255.0) ^ 2.2)
 
 ### 3.9 入口参数校验
 
-`led_core_layer_play()` 在启动动画前执行以下校验，不满足则忽略调用（静默丢弃）：
+`led_core_layer_play()` 在启动动画前执行以下校验：
 
-| 校验项 | 条件 |
-|--------|------|
-| layer_id 范围 | `layer_id < num_layers` |
-| BREATHE period | `period >= 2` |
-| PULSE decay_duration | `decay_duration >= 1` |
-| BLINK cycle_period | `on_duration + off_duration >= 1` |
+| 校验项 | 条件 | 失败行为 |
+|--------|------|----------|
+| layer_id 范围 | `layer_id < num_layers` | DEBUG: assert 触发；RELEASE: 静默丢弃 |
+| BREATHE period | `period >= 2` | DEBUG: assert 触发；RELEASE: 静默丢弃 |
+| PULSE decay_duration | `decay_duration >= 1` | DEBUG: assert 触发；RELEASE: 静默丢弃 |
+| BLINK cycle_period | `(uint32_t)on_duration + off_duration >= 1` | DEBUG: assert 触发；RELEASE: 静默丢弃 |
+
+**DEBUG/RELEASE 行为说明**：
+
+```c
+// led_core.c 内部
+#ifdef LED_CORE_DEBUG
+  #include <assert.h>
+  #define LED_CORE_ASSERT(cond) assert(cond)
+#else
+  #define LED_CORE_ASSERT(cond) ((void)0)
+#endif
+
+void led_core_layer_play(led_layer_id_t layer_id,
+                         const led_anim_params_t *params,
+                         uint32_t duration_ms) {
+    LED_CORE_ASSERT(layer_id < g_engine.num_layers);
+    if (layer_id >= g_engine.num_layers) return;
+
+    // 类型特定校验
+    switch (params->type) {
+        case LED_ANIM_BREATHE:
+            LED_CORE_ASSERT(params->breathe_params.period >= 2);
+            if (params->breathe_params.period < 2) return;
+            break;
+        case LED_ANIM_PULSE:
+            LED_CORE_ASSERT(params->pulse_params.decay_duration >= 1);
+            if (params->pulse_params.decay_duration < 1) return;
+            break;
+        case LED_ANIM_BLINK:
+            LED_CORE_ASSERT((uint32_t)params->blink_params.on_duration
+                          + params->blink_params.off_duration >= 1);
+            if ((uint32_t)params->blink_params.on_duration
+              + params->blink_params.off_duration < 1) return;
+            break;
+        default:
+            break;
+    }
+
+    // ... 正常启动逻辑 ...
+}
+```
+
+**构建配置**：开发阶段在 CMakeLists.txt 中定义 `LED_CORE_DEBUG`；发布构建不定义，assert 被编译为空操作，零开销。
+
+### 3.10 `led_core_init()` 重置语义
+
+`led_core_init()` 执行以下完整重置：
+
+```c
+bool led_core_init(uint8_t num_layers, led_output_cb_t output_cb) {
+    if (num_layers < 1 || num_layers > LED_CORE_MAX_LAYERS) return false;
+    if (output_cb == NULL) return false;
+
+    g_engine.num_layers = num_layers;
+    g_engine.output_cb  = output_cb;
+    g_engine.time_ms    = 0;           // 重置内部时钟
+    g_engine.gamma_table = DEFAULT_GAMMA_TABLE;
+    g_engine.initialized = true;
+
+    // 重置所有层为 IDLE（手动循环，不依赖 string.h）
+    for (uint8_t i = 0; i < LED_CORE_MAX_LAYERS; i++) {
+        g_engine.layers[i].state = LED_LAYER_IDLE;
+        g_engine.layers[i].start_time_ms = 0;
+        g_engine.layers[i].duration_ms = 0;
+    }
+
+    return true;
+}
+```
+
+**注意**：多次调用 `led_core_init()` 是安全的（幂等重置），主要服务于单元测试场景。
 
 ---
 
@@ -558,8 +632,8 @@ APP 层的职责仅限于：
 1. **定义** Lyre 产品的色板常量
 2. **定义** 亮度/时序参数
 3. **定义** 层分配方案
-4. **实现** `market/led_api.h` 中的函数（每个函数体 ≤ 5 行，纯翻译调用）
-5. **首次 `led_task()` 调用时自动完成初始化**（解决架构文档 setup() 无 LED 初始化入口的约束）
+4. **实现** `market/led_api.h` 中的函数（极薄胶水，翻译产品语义→CORE 调用）
+5. **任意公开 API 首次调用时自动完成初始化**（解决架构文档 setup() 无 LED 初始化入口的约束）
 
 ### 4.2 层分配定义
 
@@ -647,7 +721,24 @@ static const uint8_t LYRE_GAMMA_TABLE[256] = {
 };
 ```
 
-### 4.6 Market API 实现（极薄胶水）
+### 4.6 时间源封装
+
+```c
+// 薄封装：隔离平台时间 API，便于 PC 端测试时 mock
+// 生产构建：直接调用 RP2040 SDK
+// 测试构建：替换为可控时间源
+
+#ifdef LED_APP_TEST
+  // 单元测试时由测试框架提供
+  extern uint32_t test_get_time_us(void);
+  static inline uint32_t lyre_get_time_us(void) { return test_get_time_us(); }
+#else
+  #include "pico/time.h"
+  static inline uint32_t lyre_get_time_us(void) { return time_us_32(); }
+#endif
+```
+
+### 4.7 Market API 实现（极薄胶水）
 
 ```c
 // led_app.c
@@ -655,7 +746,7 @@ static const uint8_t LYRE_GAMMA_TABLE[256] = {
 #include "led_core.h"
 #include "led_hal.h"
 #include "market/led_api.h"
-#include "pico/time.h"    // time_us_32()
+// pico/time.h 通过 §4.6 的 lyre_get_time_us() 间接引入
 
 // ─── 内部状态 ───
 static bool g_led_initialized = false;
@@ -667,7 +758,7 @@ static void lyre_led_output(led_color_t color) {
     led_hal_show();
 }
 
-// ─── 内部初始化（首次 led_task() 调用时自动执行） ───
+// ─── 内部初始化（首次任意 API 调用时自动执行） ───
 static void led_app_ensure_init(void) {
     if (g_led_initialized) return;
     g_led_initialized = true;
@@ -685,6 +776,7 @@ static void led_app_ensure_init(void) {
 // ─── led_api.h 接口实现 ───
 
 void led_pulse_activity(uint8_t pot_index, uint8_t cc_value) {
+    led_app_ensure_init();
     if (!g_led_available || pot_index >= POT_COUNT) return;
 
     // 亮度下限保护：cc_value=0 时仍保证可见反馈
@@ -702,6 +794,7 @@ void led_pulse_activity(uint8_t pot_index, uint8_t cc_value) {
 }
 
 void led_set_breathing(bool enable) {
+    led_app_ensure_init();
     if (!g_led_available) return;
 
     if (enable) {
@@ -720,6 +813,7 @@ void led_set_breathing(bool enable) {
 }
 
 void led_event_save_start(void) {
+    led_app_ensure_init();
     if (!g_led_available) return;
 
     led_anim_params_t p = {0};
@@ -735,6 +829,7 @@ void led_event_save_start(void) {
 }
 
 void led_event_save_done(void) {
+    led_app_ensure_init();
     if (!g_led_available) return;
 
     led_anim_params_t p = {0};
@@ -746,6 +841,7 @@ void led_event_save_done(void) {
 }
 
 void led_event_factory_reset_start(void) {
+    led_app_ensure_init();
     if (!g_led_available) return;
 
     led_anim_params_t p = {0};
@@ -761,6 +857,7 @@ void led_event_factory_reset_start(void) {
 }
 
 void led_event_factory_reset_done(void) {
+    led_app_ensure_init();
     if (!g_led_available) return;
 
     led_anim_params_t p = {0};
@@ -772,13 +869,12 @@ void led_event_factory_reset_done(void) {
 }
 
 void led_task(void) {
-    // 首次调用时自动初始化（解决架构文档 setup() 无 LED 入口的约束）
     led_app_ensure_init();
     if (!g_led_available) return;
 
     // 使用硬件定时器获取真实经过时间，避免动画节奏漂移
     static uint32_t last_us = 0;
-    uint32_t now_us = time_us_32();
+    uint32_t now_us = lyre_get_time_us();
     uint32_t elapsed_ms = (now_us - last_us) / 1000;
     last_us = now_us;
 
@@ -790,25 +886,39 @@ void led_task(void) {
 }
 ```
 
-### 4.7 APP 层代码量统计
+### 4.8 APP 层代码量统计
 
 | 内容 | 行数（约） |
 |------|-----------|
 | 色板 + 参数宏定义 | ~45 行 |
-| Market API 实现（7 个函数） | ~80 行 |
+| 时间源封装 | ~10 行 |
+| Market API 实现（7 个函数） | ~85 行 |
 | 初始化 + 回调 + 守卫 | ~20 行 |
-| **合计** | **~145 行** |
+| **合计** | **~160 行** |
 
 无条件分支逻辑（除初始化守卫和可用性检查外）、无状态机、无循环——纯定义 + 纯翻译。
 
-### 4.8 初始化策略说明
+### 4.9 初始化策略说明
 
 | 约束 | 来源 | 本设计的应对 |
 |------|------|-------------|
 | `setup()` 仅含 `pot_init()` + `cmd_cfg_init()` | 架构文档 §6.4 | 不在 setup() 中调用 LED 初始化 |
 | main 不可包含管线内部头文件 | 架构文档 §3 / §9 | `led_app_init()` 不对外暴露 |
-| LED 管线必须被初始化 | 功能需求 | `led_task()` 内部首次调用时通过 `static bool` 守卫自动完成 |
-| 被动服务原则 | 架构文档 §5 | `led_task()` 本身由 main 被动调用，初始化是其首次执行的副作用 |
+| LED 管线必须被初始化 | 功能需求 | 任意公开 API 首次调用时通过 `static bool` 守卫自动完成 |
+| 被动服务原则 | 架构文档 §5 | 所有 API 均由 main 被动调用，初始化是首次执行的副作用 |
+| 步骤 [2]/[3] 可能先于 [4] 执行 | 架构文档 §6.1 | 每个 API 入口均调用 `led_app_ensure_init()`，无论哪个先被调用都能正确初始化 |
+
+**首次调用时序保证**：
+
+```
+第一轮 loop():
+  [1] pot_poll()
+  [2] led_pulse_activity()  → led_app_ensure_init() → 初始化完成 → 正常执行
+  [3] led_set_breathing()   → led_app_ensure_init() → 已初始化，跳过 → 正常执行
+  [4] led_task()            → led_app_ensure_init() → 已初始化，跳过 → tick + render
+```
+
+无论步骤 [2]、[3]、[4] 中哪个最先被调用，初始化都会在该次调用中完成，后续调用直接跳过。不存在"首次调用被丢弃"的窗口。
 
 ---
 
@@ -835,13 +945,13 @@ LAYER_BASE  (优先级0):  [IDLE]────────────[BREATHE白
 ```
 场景：呼吸中 → save_start（黄闪）→ 推杆活动（脉冲覆盖黄闪）→ save_done（绿亮）
 
-LAYER_EVENT:  [IDLE]──[BLINK黄 无限]──[PULSE蓝 350ms]──[BLINK黄恢复?]──[STATIC绿 2s]──[IDLE]
-LAYER_BASE:   [BREATHE 无限]──────────────────────────────────────────────────────────────
+LAYER_EVENT:  [IDLE]──[BLINK黄 无限]──[PULSE蓝 350ms]──[IDLE]──[STATIC绿 2s]──[IDLE]
+LAYER_BASE:   [BREATHE 无限]──────────────────────────────────────────────────────────
 
-输出:         白呼吸 ── 黄闪 ── 蓝脉冲 ── 黄闪 ── 绿亮 ── 白呼吸
+输出:         白呼吸 ── 黄闪 ── 蓝脉冲 ── 白呼吸 ── 绿亮 ── 白呼吸
 ```
 
-**注意**：由于所有事件共享 LAYER_EVENT，`led_pulse_activity()` 会**替换**正在进行的黄闪。脉冲 350ms 结束后，黄闪不会自动恢复（因为已被替换）。这是"后到事件覆盖前一个"语义的自然结果。
+**注意**：由于所有事件共享 LAYER_EVENT，`led_pulse_activity()` 会**替换**正在进行的黄闪。脉冲 350ms 结束后，黄闪不会自动恢复（因为已被替换），穿透到 BASE 层呼吸。这是"后到事件覆盖前一个"语义的自然结果。
 
 如果产品要求"脉冲结束后恢复黄闪"，则需要将事件层拆分为两层。当前架构文档未提出此需求，2 层方案满足所有已定义场景。
 
@@ -869,14 +979,14 @@ LAYER_BASE:   [BREATHE 无限]────────────────�
 void setup() {
     pot_init();
     cmd_cfg_init();
-    // 注意：无 LED 初始化调用。LED 管线在首次 led_task() 时自动初始化。
+    // 注意：无 LED 初始化调用。LED 管线在首次任意 LED API 调用时自动初始化。
 }
 
 void loop() {
     // [1] pot_poll()
-    // [2] MIDI 发送 + led_pulse_activity()
-    // [3] USB 连接检测 + led_set_breathing()
-    // [4] led_task()          ← 驱动 CORE 时间推进 + 渲染输出
+    // [2] MIDI 发送 + led_pulse_activity()   ← 若首次调用，此处完成初始化
+    // [3] USB 连接检测 + led_set_breathing() ← 若 [2] 未触发，此处完成初始化
+    // [4] led_task()                         ← 若 [2][3] 均未触发，此处完成初始化
 
     led_task();   // 内部：自动初始化 + 真实 elapsed + tick + render
 }
@@ -891,7 +1001,7 @@ void loop() {
 ### 7.1 CORE 层单元测试（PC 端）
 
 ```c
-// test_led_core.c（在 PC 上编译运行）
+// test_led_core.c（在 PC 上编译运行，定义 LED_CORE_DEBUG）
 #include "led_core.h"
 #include <stdio.h>
 #include <assert.h>
@@ -900,7 +1010,7 @@ static led_color_t g_last_output;
 static void mock_output(led_color_t c) { g_last_output = c; }
 
 void test_breathe_reaches_peak() {
-    led_core_init(1, mock_output);
+    led_core_init(1, mock_output);  // 重置 time_ms = 0
 
     led_anim_params_t p = {0};
     p.type = LED_ANIM_BREATHE;
@@ -921,7 +1031,7 @@ void test_breathe_reaches_peak() {
 }
 
 void test_pulse_no_overflow() {
-    led_core_init(1, mock_output);
+    led_core_init(1, mock_output);  // 重置 time_ms = 0
 
     led_anim_params_t p = {0};
     p.type = LED_ANIM_PULSE;
@@ -938,7 +1048,7 @@ void test_pulse_no_overflow() {
 }
 
 void test_duration_expires_before_output() {
-    led_core_init(2, mock_output);
+    led_core_init(2, mock_output);  // 重置 time_ms = 0
 
     // 低优先级层：呼吸
     led_anim_params_t base = {0};
@@ -964,7 +1074,7 @@ void test_duration_expires_before_output() {
 }
 
 void test_breathe_odd_period_symmetry() {
-    led_core_init(1, mock_output);
+    led_core_init(1, mock_output);  // 重置 time_ms = 0
 
     led_anim_params_t p = {0};
     p.type = LED_ANIM_BREATHE;
@@ -990,16 +1100,59 @@ void test_breathe_odd_period_symmetry() {
     int diff = (int)rising - (int)falling;
     assert(diff >= -2 && diff <= 2);
 }
+
+void test_init_resets_time() {
+    // 第一次初始化并推进时间
+    led_core_init(1, mock_output);
+    led_core_tick(5000);
+    assert(led_core_get_time_ms() == 5000);
+
+    // 第二次初始化应重置时间
+    led_core_init(1, mock_output);
+    assert(led_core_get_time_ms() == 0);
+}
+
+void test_invalid_layer_asserts() {
+    led_core_init(2, mock_output);
+
+    // 以下调用在 DEBUG 构建中应触发 assert
+    // 在 RELEASE 构建中应静默丢弃
+    led_anim_params_t p = {0};
+    p.type = LED_ANIM_STATIC;
+    p.static_params.brightness = 100;
+
+    led_core_layer_play(5, &p, 0);  // layer_id=5 >= num_layers=2
+    // 不应崩溃（RELEASE 模式）
+}
 ```
 
-### 7.2 APP 层验证
+### 7.2 APP 层集成测试（PC 端）
 
-APP 层逻辑极简，通过集成测试验证：
-- 调用 `led_event_save_start()` 后，`led_core_layer_get_state(LAYER_EVENT) == RUNNING`
-- 推进 2100ms 后，`led_event_save_done()` 的 STATIC 动画自动 FINISHED
-- 最终输出回落到 BASE 层呼吸
-- `led_pulse_activity(0, 0)` 产生亮度 ≥ 30 的可见脉冲
-- 首次 `led_task()` 调用前未初始化，调用后 `g_led_available == true`
+```c
+// test_led_app.c（定义 LED_APP_TEST，提供 mock 时间源）
+
+static uint32_t g_mock_time_us = 0;
+uint32_t test_get_time_us(void) { return g_mock_time_us; }
+
+void test_first_api_call_initializes() {
+    // 模拟：led_set_breathing 在 led_task 之前被调用
+    g_mock_time_us = 1000000;  // 1s
+
+    led_set_breathing(true);  // 应触发初始化并成功启动呼吸
+
+    // 验证：BASE 层应为 RUNNING
+    assert(led_core_layer_get_state(LAYER_BASE) == LED_LAYER_RUNNING);
+}
+
+void test_pulse_with_zero_cc() {
+    led_app_ensure_init();  // 确保已初始化
+
+    led_pulse_activity(0, 0);  // cc_value = 0
+
+    // 验证：EVENT 层应为 RUNNING（亮度被钳位到 30，不是 0）
+    assert(led_core_layer_get_state(LAYER_EVENT) == LED_LAYER_RUNNING);
+}
+```
 
 ---
 
@@ -1007,12 +1160,21 @@ APP 层逻辑极简，通过集成测试验证：
 
 将 LED CORE 层移植到新产品时，仅需：
 
-| 步骤 | 工作量 |
-|------|--------|
-| 1. 拷贝 `led_core.c/h` 到新项目 | 0 修改 |
-| 2. 重写 `led_hal.c`（适配新硬件） | ~50 行 |
-| 3. 重写 `led_app.c`（新色板 + 新参数 + 新 API 实现） | ~120 行 |
-| 4. 定义新的 `market/led_api.h`（按新产品需求） | 按需 |
+| 步骤 | 工作量 | 说明 |
+|------|--------|------|
+| 1. 拷贝 `led_core.c/h` 到新项目 | 0 修改 | 零外部依赖，直接编译 |
+| 2. 重写 `led_hal.c`（适配新硬件） | ~50 行 | 实现 `led_hal_init/set_pixel/show/clear` |
+| 3. 重写 `led_app.c`（新色板 + 新参数 + 新 API 实现） | ~120 行 | 包含时间源适配（见下） |
+| 4. 定义新的 `market/led_api.h`（按新产品需求） | 按需 | 冻结契约 |
+
+**时间源适配**：APP 层通过 `lyre_get_time_us()` 获取微秒时间戳。移植时需替换为目标平台的等效实现：
+
+| 平台 | 实现 |
+|------|------|
+| RP2040 | `time_us_32()`（Pico SDK） |
+| STM32 | `HAL_GetTick() * 1000` 或 DWT 计数器 |
+| ESP32 | `esp_timer_get_time()` |
+| PC 测试 | mock 函数（`LED_APP_TEST` 宏） |
 
 CORE 层代码**零修改**。
 
@@ -1043,11 +1205,11 @@ market/
 | LED-DD-002 | 动画参数使用联合体而非多态 | C 语言无继承，联合体 + type 枚举是最简洁的零开销方案 |
 | LED-DD-003 | PULSE 使用分步定点缩放（ratio_norm → 平方 → 移位） | M0+ 无 FPU；分步缩放保证 uint32_t 全范围安全，无需 uint64_t 除法 |
 | LED-DD-004 | 层数量由 APP 层初始化时指定，CORE 不硬编码 | 不同产品可能需要不同层数；编译期上限 LED_CORE_MAX_LAYERS=8 防止越界 |
-| LED-DD-005 | `led_task()` 使用 `time_us_32()` 获取真实 elapsed | 主循环周期为"~10ms"（约数），硬编码会导致动画节奏漂移；`time_us_32()` 为单次寄存器访问，开销 < 100ns |
+| LED-DD-005 | `led_task()` 使用硬件定时器获取真实 elapsed | 主循环周期为"~10ms"（约数），硬编码会导致动画节奏漂移；通过 `lyre_get_time_us()` 封装，便于测试 mock |
 | LED-DD-006 | 所有事件（pulse、save、reset）共享同一最高优先级层（2 层方案） | 架构文档 §4.5 将 pulse_activity 与 save/reset 同归"事件快闪"最高优先级；后到事件自然覆盖前一个，语义正确且实现最简 |
 | LED-DD-007 | Gamma 表由 CORE 内部拷贝（256 字节静态缓冲区） | 消除调用者对指针生命周期的负担；256 字节开销在 264KB SRAM 中可忽略 |
 | LED-DD-008 | 无限闪烁动画设置 30s 防御性超时 | 防止状态机异常导致 LED 永久卡在闪烁状态；30s 远超正常操作时间，不影响正常流程 |
-| LED-DD-009 | `led_task()` 内部首次调用自动初始化（static bool 守卫） | 架构文档 §6.4 的 setup() 无 LED 初始化入口，main 不可包含管线内部头文件；自动初始化是唯一合规方案 |
+| LED-DD-009 | 任意公开 API 首次调用自动初始化（static bool 守卫） | 架构文档 §6.4 的 setup() 无 LED 初始化入口；步骤 [2]/[3] 可能先于 [4] 执行；每个 API 入口均调用 ensure_init 消除竞态窗口 |
 | LED-DD-010 | 层数组使用静态分配（`LED_CORE_MAX_LAYERS`），无 malloc | 嵌入式系统应避免动态分配；Lyre 固定 2 层，8 层上限覆盖所有合理产品 |
 | LED-DD-011 | `cc_value` 映射亮度时设置下限 30 | 推杆在端点位置（cc=0）时仍需可见活动反馈；活动反馈语义与推杆位置无关 |
 | LED-DD-012 | `led_core_render()` 先检查到期再输出 | 避免到期帧多输出一帧动画颜色；确保有限时长动画精确结束 |
@@ -1055,27 +1217,27 @@ market/
 | LED-DD-014 | 动画替换无过渡（瞬时切换） | 事件切换的瞬时性是产品语义的一部分（黄闪→绿亮 = "完成"）；预留 transition 参数属过度设计 |
 | LED-DD-015 | BLINK 的 `repeat_count` 与 `duration_ms` 先到者生效 | 明确双重终止条件的交互语义；`duration_ms` 是层的强制生命周期上限 |
 | LED-DD-016 | CORE 层不使用 `<string.h>`，初始化用手动循环 | 消除隐式依赖，保持头文件 include 列表与 §3.8 声明一致 |
+| LED-DD-017 | `led_core_init()` 重置 `time_ms = 0` 及所有层状态 | 保证多次调用幂等；单元测试中连续用例互不干扰 |
+| LED-DD-018 | DEBUG 构建下参数校验失败触发 assert，RELEASE 下静默丢弃 | 开发阶段快速定位错误；生产环境零开销、无崩溃风险 |
+| LED-DD-019 | BLINK `cycle_period` 以 `uint32_t` 显式计算 | C 语言整数提升自然保证安全，但显式转换消除歧义，防止未来重构引入 uint16_t 存储 |
+| LED-DD-020 | APP 层时间源通过 `lyre_get_time_us()` 薄封装 | 隔离平台 API 依赖；`LED_APP_TEST` 宏下可替换为 mock，支持 PC 端集成测试 |
 
 ---
 
-## 附录 A：v1.0 → v1.1 变更摘要
+## 附录 A：v1.1 → v1.2 变更摘要
 
-| 章节 | 变更内容 |
-|------|----------|
-| §0（新增） | 审计闭环追踪表 |
-| §3.2 | `led_color_lerp` 统一为 0–255 + 四舍五入；`led_core_set_gamma_table` 改为内部拷贝；`led_core_init` 改为静态分配；`led_core_layer_play` 补充双重终止语义；`led_core_render` 调整为先检查到期再输出；BREATHE period 增加 ≥2 约束；PULSE decay_duration 增加 ≥1 约束 |
-| §3.3 | 层数组改为 `led_layer_t layers[LED_CORE_MAX_LAYERS]`；新增 `gamma_buf[256]`；移除 `blink_cycle` 字段（改为运行时计算） |
-| §3.4.3 | BREATHE 改用 2× 精度算法 |
-| §3.4.5 | PULSE 改用分步定点缩放，附溢出安全证明 |
-| §3.5 | 调度算法步骤重排：到期检查 → 扫描 → 输出 |
-| §3.6 | `lerp_u8` 改为 0–255 范围 + 四舍五入公式 |
-| §3.7 | 明确 gamma 表内部拷贝机制 |
-| §3.8 | 依赖声明移除 `<string.h>`；新增"无动态分配"条目 |
-| §3.9（新增） | 入口参数校验表 |
-| §4.2 | 3 层 → 2 层，删除 LAYER_ACTIVITY |
-| §4.4 | 新增 `LYRE_PULSE_MIN_BRIGHTNESS`、`LYRE_SAVE_START_TIMEOUT_MS`、`LYRE_RESET_TIMEOUT_MS` |
-| §4.6 | 所有函数增加 `g_led_available` 守卫；`led_pulse_activity` 增加亮度下限；save/reset start 增加 30s 超时；`led_task` 改用 `time_us_32()` 真实 elapsed + 首次调用自动初始化 |
-| §4.8（新增） | 初始化策略说明表 |
-| §5 | 全部时序图统一为 2 层；新增 §5.3 防御性超时场景 |
-| §7.1 | 新增溢出测试、到期顺序测试、奇数 period 对称性测试 |
-| §10 | 新增 LED-DD-006 ~ LED-DD-016；LED-DD-003 更新为分步定点；LED-DD-005 更新为 time_us_32() |
+| 章节 | 变更内容 | 对应审计 ID |
+|------|----------|-------------|
+| §0 | 新增 v1.1 缺陷闭环追踪表 | — |
+| §3.2 | `led_core_init()` 文档补充"重置内部时钟"语义 | NEW-004 |
+| §3.3 | 注释补充 `time_ms` 重置说明 | NEW-004 |
+| §3.4.2 | `cycle_period` 显式标注 `uint32_t` 计算 | NEW-005 |
+| §3.9 | 校验表增加"失败行为"列（DEBUG assert / RELEASE 静默）；BLINK 校验改为 `(uint32_t)` 显式转换；新增完整代码示例 | NEW-002, NEW-005 |
+| §3.10（新增） | `led_core_init()` 完整重置逻辑代码 + 幂等性说明 | NEW-004 |
+| §4.6（新增） | 时间源封装 `lyre_get_time_us()` + `LED_APP_TEST` 条件编译 | NEW-003 |
+| §4.7 | 所有 7 个 API 函数入口增加 `led_app_ensure_init()` 调用；`led_task()` 改用 `lyre_get_time_us()` | NEW-001, NEW-003 |
+| §4.9 | 初始化策略表新增"步骤 [2]/[3] 可能先于 [4]"行；新增首次调用时序保证示例 | NEW-001 |
+| §7.1 | 新增 `test_init_resets_time`、`test_invalid_layer_asserts` | NEW-004, NEW-002 |
+| §7.2（新增） | APP 层 PC 端集成测试示例（mock 时间源） | NEW-003 |
+| §8 | 移植指南新增"时间源适配"表 | NEW-003 |
+| §10 | 新增 LED-DD-017 ~ LED-DD-020 | NEW-001 ~ NEW-005 |
